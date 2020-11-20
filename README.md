@@ -1,5 +1,5 @@
 # ipbw
-IPBW - Interplanetary Black Widow: a Go-based crawler of IPFS nodes!
+IPBW: Interplanetary Black Widow crawls ur ipfs nodes
 
 ## About
 
