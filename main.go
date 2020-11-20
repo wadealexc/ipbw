@@ -13,6 +13,7 @@ import (
 
 	"github.com/ipfs/go-datastore"
 	badger "github.com/ipfs/go-ds-badger"
+	logging "github.com/ipfs/go-log"
 	"github.com/libp2p/go-libp2p"
 	"github.com/libp2p/go-libp2p-core/peer"
 	"github.com/libp2p/go-libp2p-core/routing"
@@ -372,6 +373,13 @@ func filterSelf(self peer.ID, responsesRaw []*peer.AddrInfo) []*peer.AddrInfo {
 }
 
 func main() {
+	// Silence that one annoying errorw from basichost.
+	// I know, we have too many open files!
+	lvl, err := logging.LevelFromString("DPANIC")
+	if err != nil {
+		panic(err)
+	}
+	logging.SetAllLoggers(lvl)
 
 	// Parse CLI flags
 	flag.Parse()
