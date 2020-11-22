@@ -1,10 +1,13 @@
 package main
 
 import (
+	"bytes"
 	"context"
-	"encoding/csv"
+	"encoding/json"
 	"flag"
 	"fmt"
+	"io/ioutil"
+	"net/http"
 	"os"
 	"os/signal"
 	"strings"
@@ -15,27 +18,20 @@ import (
 	badger "github.com/ipfs/go-ds-badger"
 	logging "github.com/ipfs/go-log"
 	"github.com/libp2p/go-libp2p"
+	"github.com/libp2p/go-libp2p-core/host"
 	"github.com/libp2p/go-libp2p-core/peer"
 	"github.com/libp2p/go-libp2p-core/routing"
 	"github.com/libp2p/go-libp2p-core/test"
-	host "github.com/libp2p/go-libp2p-host"
 	dht "github.com/libp2p/go-libp2p-kad-dht"
 	"github.com/libp2p/go-libp2p/p2p/protocol/identify"
+	ma "github.com/multiformats/go-multiaddr"
 )
 
 // Workers are distinct goroutines used for querying the DHT
 const Workers = 8
 
-// PeerIDFile stores IDs of discovered peers, along with the ID
-// of the peer who responded to our query. Records take the form:
-// pOrigin,pResponse
-// ... where each field is a peer ID
-const PeerIDFile = "peerIDs.csv"
-
-// IDToIPFile stores IPv4/IPv6/DNS4/DNS6 addresses of peers, along
-// with the ID of the peer located at that address. Records take the form:
-// pID,ip:port
-const IDToIPFile = "peerIPs.csv"
+// Server is the location to which the crawler reports runs to
+const Server = "http://127.0.0.1:8000/crawl"
 
 var (
 	duration = flag.Uint("d", 0, "(Optional) Number of minutes to crawl. No limit by default.")
@@ -49,60 +45,52 @@ type Crawler struct {
 	ds   datastore.Batching
 	id   *identify.IDService
 
-	// Result aggregator and file/writer pairs for output
-	results      map[peer.ID][]*peer.AddrInfo
-	peerIDWriter *csv.Writer
-	peerIDFile   *os.File
-	IDToIPWriter *csv.Writer
-	IDToIPFile   *os.File
+	// We receive QueryEvents from the DHT on this channel
+	events <-chan *routing.QueryEvent
+	// Result aggregator
+	report *Report
 
 	// Context and cancel function passed to DHT queries
 	ctx    context.Context
 	cancel context.CancelFunc
-	// We receive QueryEvents from the DHT on this channel
-	events <-chan *routing.QueryEvent
 
 	wg sync.WaitGroup
 }
 
-// NewCrawler creates an IPFS crawler.
-// It also opens CSV files for output and starts our libp2p node.
+// Report aggregates results from QueryEvents
+type Report struct {
+	// IDs maps a reporter peer to the peer IDs they told us about
+	IDs map[peer.ID][]peer.ID
+	// IPs maps a peer's ID to known IP addresses at which they can be found
+	IPs map[peer.ID][]string
+}
+
+// ReportJSON is a json-marshallable form of Report
+type ReportJSON struct {
+	IDs map[string][]string
+	IPs map[string][]string
+}
+
+// NewCrawler creates an IPFS crawler and starts our libp2p node.
 func NewCrawler() *Crawler {
+	fmt.Println("IPBW: Starting crawler")
+
 	// Create a context that, when passed to DHT queries, emits QueryEvents to this channel
 	ctx, cancel := context.WithCancel(context.Background())
 	ctx, events := routing.RegisterForQueryEvents(ctx)
 
 	c := &Crawler{
-		results: make(map[peer.ID][]*peer.AddrInfo),
-		ctx:     ctx,
-		cancel:  cancel,
-		events:  events,
+		ctx:    ctx,
+		cancel: cancel,
+		events: events,
+		report: &Report{
+			IDs: make(map[peer.ID][]peer.ID),
+			IPs: make(map[peer.ID][]string),
+		},
 	}
 
-	c.initCSV()
 	c.initHost()
 	return c
-}
-
-// Create output files, as well as writers for those files
-func (c *Crawler) initCSV() {
-	file, err := os.Create(PeerIDFile)
-	if err != nil {
-		panic(err)
-	}
-	writer := csv.NewWriter(file)
-
-	c.peerIDWriter = writer
-	c.peerIDFile = file
-
-	file, err = os.Create(IDToIPFile)
-	if err != nil {
-		panic(err)
-	}
-	writer = csv.NewWriter(file)
-
-	c.IDToIPWriter = writer
-	c.IDToIPFile = file
 }
 
 // Start our libp2p node
@@ -145,7 +133,6 @@ func (c *Crawler) initHost() {
 // Spawn an aggregator to collect results from c.events
 // Spawn a reporter to print incremental status updates
 func (c *Crawler) start(numWorkers int) {
-	fmt.Println("IPBW: Starting crawl")
 	fmt.Printf("Spawning %d workers\n", numWorkers)
 
 	for i := 0; i < numWorkers; i++ {
@@ -155,8 +142,19 @@ func (c *Crawler) start(numWorkers int) {
 
 	go c.aggregator()
 	go c.reporter()
+}
 
-	// c.host.Network().Notify((*notifee)(c))
+// Called when we finish a crawl. Kills our goroutines and posts results to our server
+func (c *Crawler) close() {
+	c.cancel()
+	c.wg.Done()
+
+	c.finalizeReport()
+	c.publishResults()
+
+	if err := c.ds.Close(); err != nil {
+		fmt.Printf("error while shutting down: %v\n", err)
+	}
 }
 
 // Each worker generates a random peer ID, then queries the DHT
@@ -182,7 +180,7 @@ func (c *Crawler) reporter() {
 		select {
 		case <-time.After(10 * time.Second):
 			elapsed += 10
-			fmt.Printf("--- %d unique peers", len(c.results))
+			fmt.Printf("--- %d unique peers", len(c.report.IDs))
 			if elapsed == 60 {
 				// This is very important
 				fmt.Printf("; time elapsed: %d minute\n", elapsed/60)
@@ -199,169 +197,219 @@ func (c *Crawler) reporter() {
 
 // Receives and filters QueryEvents from the DHT
 func (c *Crawler) aggregator() {
-	for e := range c.events {
+	// Get our PeerID, so we can filter responses that come from our own node
+	self := c.dht.PeerID()
+
+	for report := range c.events {
 		// We only care about PeerResponse events, as these
 		// are peers informing us of peers they know.
-		if e.Type == routing.PeerResponse {
-			// Make sure we don't record responses from our own node!
-			self := c.dht.PeerID()
-			if self.String() == e.ID.String() {
-				fmt.Printf("Self-report; skipping!\n")
-				continue
-			}
-			// Filter out e.Responses - we don't want our own node
-			queryResponses := filterSelf(self, e.Responses)
-			// No remaining responses? Skip.
-			if len(queryResponses) == 0 {
-				continue
-			}
-
-			// If we haven't seen this peer yet, we don't need to think too hard
-			// Just set the responses and continue!
-			if _, exists := c.results[e.ID]; !exists {
-				c.results[e.ID] = queryResponses
-			} else {
-				// Okay, we've seen this peer already!
-				// Add new responses and filter out duplicates:
-				seen := map[peer.ID]struct{}{}
-				var responses []*peer.AddrInfo
-				// Iterate over existing results and track which IDs we've seen:
-				for _, r := range c.results[e.ID] {
-					// filter dupes
-					if _, exists := seen[r.ID]; exists {
-						continue
-					}
-
-					seen[r.ID] = struct{}{}
-					responses = append(responses, r)
-				}
-
-				// Iterate over incoming results and append IDs we haven't seen:
-				for _, r := range queryResponses {
-					// filter dupes
-					if _, exists := seen[r.ID]; exists {
-						continue
-					}
-
-					seen[r.ID] = struct{}{}
-					responses = append(responses, r)
-				}
-
-				// Skip empty responses
-				if len(responses) == 0 {
-					continue
-				}
-
-				c.results[e.ID] = responses
-			}
-		}
-	}
-}
-
-// Called when we finish a crawl. Kills our goroutines and writes output to a file.
-func (c *Crawler) close() {
-	c.cancel()
-	c.wg.Done()
-
-	c.writeToFile()
-
-	if err := c.ds.Close(); err != nil {
-		fmt.Printf("error while shutting down: %v\n", err)
-	}
-}
-
-func (c *Crawler) writeToFile() {
-	fmt.Println("Writing results to file...")
-
-	// Make sure we close our files and flush our writers at the end of this method
-	defer c.peerIDFile.Close()
-	defer c.IDToIPFile.Close()
-
-	defer c.peerIDWriter.Flush()
-	defer c.IDToIPWriter.Flush()
-
-	pStore := c.host.Peerstore()
-	var numSkipped int = 0
-
-	for pID, addrs := range c.results {
-		// Try to get IPv4/IPv6 addresses for this peer
-		pInfo := pStore.Addrs(pID)
-
-		// Maybe we don't know ANY multiaddrs for this peer? Skip if so...
-		if len(pInfo) == 0 {
-			numSkipped++
+		if report.Type != routing.PeerResponse {
 			continue
 		}
 
-		var count int = 0
-		// Iterate over []Multiaddr returned for our reporting peer (pID)
-		// We want to find each IPv4 / IPv6 address and add it to ipFile
-		for _, a := range pInfo {
-			fields := strings.Split(a.String(), "/")
-			var (
-				res       string
-				portFound bool
-				ipFound   bool
-			)
-			for i, field := range fields {
-				// Found IPv4/IPv6 or DNS; add to result
-				if field == "ip4" || field == "ip6" || field == "dns4" || field == "dns6" {
-					if res != "" {
-						fmt.Printf("Possible malformed ip %s; skipping...\n", a.String())
-						break
-					} else if i+1 >= len(fields) {
-						fmt.Printf("Unexpected EOField %s; skipping...\n", a.String())
-						break
-					} else if fields[i+1] == "127.0.0.1" {
-						// Skip localhost
-						break
-					}
-					res = fields[i+1]
-					ipFound = true
-				} else if field == "udp" || field == "tcp" { // Port found; add to result
-					if res == "" {
-						fmt.Printf("Possible malformed port %s; skipping...\n", a.String())
-						break
-					} else if i+1 >= len(fields) {
-						fmt.Printf("Unexpected EOField %s; skipping...\n", a.String())
-						break
-					}
-					res = res + ":" + fields[i+1]
-					portFound = true
+		// Skip responses from our node
+		if self.String() == report.ID.String() {
+			continue
+		}
+
+		// Filter out responses - we don't want our own node
+		queryResponses := filterSelf(self, report.Responses)
+		// No remaining responses? Skip.
+		if len(queryResponses) == 0 {
+			continue
+		}
+
+		seenID := map[peer.ID]struct{}{}
+		var reportedIDs []peer.ID
+		// Iterate over existing results and track which IDs we've seen:
+		for _, id := range c.report.IDs[report.ID] {
+			// Filter dupes
+			if _, exists := seenID[id]; !exists {
+				seenID[id] = struct{}{}
+				reportedIDs = append(reportedIDs, id)
+			}
+		}
+
+		// Response: AddrInfo { ID peer.ID; Addrs []MultiAddr }
+		for _, r := range queryResponses {
+			// Filter dupes
+			if _, exists := seenID[r.ID]; !exists {
+				seenID[r.ID] = struct{}{}
+				reportedIDs = append(reportedIDs, r.ID)
+			}
+
+			// Filter response multiaddrs for IP+port combinations
+			responseIPs := filterIPs(r.Addrs)
+			if len(responseIPs) == 0 {
+				continue // found nothing; skip
+			}
+
+			seenIP := map[string]struct{}{}
+			var reportedIPs []string
+			// Iterate over existing IPs and track which ones we've seen:
+			for _, ip := range c.report.IPs[r.ID] {
+				// Filter dupes
+				if _, exists := seenIP[ip]; !exists {
+					seenIP[ip] = struct{}{}
+					reportedIPs = append(reportedIPs, ip)
+				}
+			}
+
+			// Now, add newly-reported IPs to our report:
+			for _, ip := range responseIPs {
+				if _, exists := seenIP[ip]; !exists {
+					seenIP[ip] = struct{}{}
+					reportedIPs = append(reportedIPs, ip)
+				}
+			}
+
+			if len(reportedIPs) != 0 {
+				c.report.IPs[r.ID] = reportedIPs
+			}
+		}
+
+		if len(reportedIDs) != 0 {
+			c.report.IDs[report.ID] = reportedIDs
+		}
+	}
+}
+
+// Do a final pass over our reporter IDs and check the DHT PeerStore to see
+// if we know of any additional IPs for them
+func (c *Crawler) finalizeReport() {
+	fmt.Println("Finalizing report...")
+	pStore := c.host.Peerstore()
+
+	for id := range c.report.IDs {
+		// Try and find addresses for this peer
+		addrs := pStore.Addrs(id)
+
+		// Filter for ip+port combinations
+		reporterIPs := filterIPs(addrs)
+		if len(reporterIPs) == 0 {
+			continue // found nothing; skip :(
+		}
+
+		seenIP := map[string]struct{}{}
+		var resultIPs []string
+		// Iterate over existing IPs and track what we've seen:
+		for _, ip := range c.report.IPs[id] {
+			// Filter dupes
+			if _, exists := seenIP[ip]; !exists {
+				seenIP[ip] = struct{}{}
+				resultIPs = append(resultIPs, ip)
+			}
+		}
+
+		// Now, add newly-filtered IPs to our report:
+		for _, ip := range reporterIPs {
+			// Filter dupes
+			if _, exists := seenIP[ip]; !exists {
+				seenIP[ip] = struct{}{}
+				resultIPs = append(resultIPs, ip)
+			}
+		}
+
+		if len(resultIPs) != 0 {
+			c.report.IPs[id] = resultIPs
+		}
+	}
+}
+
+// Send c.report to server
+func (c *Crawler) publishResults() {
+	fmt.Printf("Sending results to server at %s\n", Server)
+
+	results := &ReportJSON{
+		IDs: make(map[string][]string),
+		IPs: make(map[string][]string),
+	}
+
+	// Prettyify reported IDs and add to results
+	for source, targets := range c.report.IDs {
+		targetsPretty := make([]string, 0)
+		for _, target := range targets {
+			targetsPretty = append(targetsPretty, target.Pretty())
+		}
+
+		results.IDs[source.Pretty()] = targetsPretty
+	}
+
+	// Prettyify reported target IDs and add to results
+	for peer, addrs := range c.report.IPs {
+		results.IPs[peer.Pretty()] = addrs
+	}
+
+	reportBody, err := json.Marshal(results)
+	if err != nil {
+		panic(err) // not even gonna try and recover lol
+	}
+
+	resp, err := http.Post(Server, "application/json", bytes.NewBuffer(reportBody))
+	if err != nil {
+		panic(err)
+	}
+
+	defer resp.Body.Close()
+
+	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		panic(err)
+	}
+
+	fmt.Println(string(body))
+}
+
+// Iterates over a collection of multiaddrs and attempts to find ip+port combos
+func filterIPs(addrs []ma.Multiaddr) []string {
+	var results []string = make([]string, 0)
+	for _, addr := range addrs {
+		fields := strings.Split(addr.String(), "/")
+
+		var (
+			res       string
+			portFound bool
+			ipFound   bool
+		)
+		// Iterate over the split multiaddr. First, look for an IP (IPv4, IPv6, DNS4, DNS6)
+		// Then, find a port (UDP, TCP)
+		for i, field := range fields {
+			if field == "ip4" || field == "ip6" || field == "dns4" || field == "dns6" || field == "dnsaddr" { // found ip
+				if res != "" {
+					fmt.Printf("Possible malformed multiaddr %s; skipping\n", addr.String())
+					break
+				} else if i+1 >= len(fields) {
+					fmt.Printf("Unexpected EOField in %s; skipping\n", addr.String())
+					break
+				} else if fields[i+1] == "127.0.0.1" {
+					// Skip localhost
 					break
 				}
-			}
-
-			// Nice, we got an address! Write to file:
-			if ipFound && portFound {
-				count++
-				result := make([]string, 2)
-				result[0] = pID.Pretty()
-				result[1] = res
-				c.IDToIPWriter.Write(result)
+				res = fields[i+1]
+				ipFound = true
+			} else if field == "udp" || field == "tcp" { // found port
+				if res == "" {
+					fmt.Printf("Possible malformed multiaddr %s; skipping\n", addr.String())
+					break
+				} else if i+1 >= len(fields) {
+					fmt.Printf("Unexpected EOField in %s; skipping\n", addr.String())
+					break
+				}
+				res = res + ":" + fields[i+1]
+				portFound = true
+				break
 			}
 		}
 
-		// So, we found multiaddrs for this peer, but didn't find IPv4 / IPv6? Weird... skip.
-		if count == 0 {
-			fmt.Printf("%s has %d maddrs, but no ip4/ip6/dns4/dns6!\nAddrs:%v\n", pID.Pretty(), len(pInfo), pInfo)
-			continue
-		}
-
-		for _, addr := range addrs {
-			result := make([]string, 2)
-			result[0] = pID.Pretty()
-			result[1] = addr.ID.Pretty()
-			c.peerIDWriter.Write(result)
+		// Nice, we found a well-formed IP+Port! Add to results:
+		if ipFound && portFound {
+			results = append(results, res)
 		}
 	}
-
-	fmt.Printf("Finishing write. Skipped %d peers with no known multiaddrs\n", numSkipped)
+	return results
 }
 
-/**
- * Filter DHT query responses that contain our own peer ID
- */
+// Filter DHT query responses that contain our own peer ID
 func filterSelf(self peer.ID, responsesRaw []*peer.AddrInfo) []*peer.AddrInfo {
 	var res []*peer.AddrInfo = make([]*peer.AddrInfo, 0)
 	for _, info := range responsesRaw {
