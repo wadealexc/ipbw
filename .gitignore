@@ -2,3 +2,4 @@
 peerIDs.csv
 peerIPs.csv
 ipbw
+__pycache__/

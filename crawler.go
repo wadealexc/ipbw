@@ -440,27 +440,23 @@ func main() {
 	ch := make(chan os.Signal, 1)
 	signal.Notify(ch, os.Interrupt, os.Kill)
 
+	// 5 minute default run
+	var dur uint = 5
 	if *duration != 0 {
-		// Duration specified - calculate total runtime
-		totalDuration := time.Duration(*duration) * 60 * time.Second
-		fmt.Printf("(Running %d minute crawl)\n", *duration)
-		select {
-		case <-time.After(totalDuration):
-			crawler.close()
-			return
-		case <-ch:
-			crawler.close()
-			return
-		case <-crawler.ctx.Done():
-			return
-		}
-	} else {
-		select {
-		case <-ch:
-			crawler.close()
-			return
-		case <-crawler.ctx.Done():
-			return
-		}
+		dur = *duration
+	}
+
+	// Calculate total runtime
+	totalDuration := time.Duration(dur) * 60 * time.Second
+	fmt.Printf("(Running %d minute crawl)\n", dur)
+	select {
+	case <-time.After(totalDuration):
+		crawler.close()
+		return
+	case <-ch:
+		crawler.close()
+		return
+	case <-crawler.ctx.Done():
+		return
 	}
 }
