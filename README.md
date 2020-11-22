@@ -25,4 +25,4 @@ The output of a 10-minute crawl was rendered in Cytoscape using an edge-weighted
 * 2450 unique peers discovered within 5 minutes
 * 3600 unique peers discovered within 10 minutes
 
-![Image](graph.png)
+![Image](output/graph.png)
