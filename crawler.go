@@ -34,7 +34,8 @@ const Workers = 8
 const Server = "http://127.0.0.1:8000/crawl"
 
 var (
-	duration = flag.Uint("d", 0, "(Optional) Number of minutes to crawl. No limit by default.")
+	duration       = flag.Uint("d", 5, "(Optional) Number of minutes to crawl. 5 minutes by default.")
+	reportInterval = flag.Uint("i", 60, "(Optional) Number of seconds between updates sent to the server. 60s by default.")
 )
 
 // Crawler holds the information about an active crawl
@@ -46,22 +47,22 @@ type Crawler struct {
 	id   *identify.IDService
 
 	// We receive QueryEvents from the DHT on this channel
-	events <-chan *routing.QueryEvent
-	// Result aggregator
-	report *Report
+	events         <-chan *routing.QueryEvent
+	report         *Report // Result aggregator
+	reportInterval uint    // How often a report is sent to the server
 
 	// Context and cancel function passed to DHT queries
 	ctx    context.Context
 	cancel context.CancelFunc
-
-	wg sync.WaitGroup
+	wg     sync.WaitGroup
 }
 
 // Report aggregates results from QueryEvents
+// IDs maps a reporter peer to the peer IDs they told us about
+// IPs maps a peer's ID to known IP addresses at which they can be found
 type Report struct {
-	// IDs maps a reporter peer to the peer IDs they told us about
+	mu  sync.RWMutex
 	IDs map[peer.ID][]peer.ID
-	// IPs maps a peer's ID to known IP addresses at which they can be found
 	IPs map[peer.ID][]string
 }
 
@@ -72,7 +73,8 @@ type ReportJSON struct {
 }
 
 // NewCrawler creates an IPFS crawler and starts our libp2p node.
-func NewCrawler() *Crawler {
+// TODO: Ping server here to see if it's running
+func NewCrawler(reportInterval uint) *Crawler {
 	fmt.Println("IPBW: Starting crawler")
 
 	// Create a context that, when passed to DHT queries, emits QueryEvents to this channel
@@ -80,9 +82,10 @@ func NewCrawler() *Crawler {
 	ctx, events := routing.RegisterForQueryEvents(ctx)
 
 	c := &Crawler{
-		ctx:    ctx,
-		cancel: cancel,
-		events: events,
+		ctx:            ctx,
+		cancel:         cancel,
+		events:         events,
+		reportInterval: reportInterval,
 		report: &Report{
 			IDs: make(map[peer.ID][]peer.ID),
 			IPs: make(map[peer.ID][]string),
@@ -149,7 +152,6 @@ func (c *Crawler) close() {
 	c.cancel()
 	c.wg.Done()
 
-	c.finalizeReport()
 	c.publishResults()
 
 	if err := c.ds.Close(); err != nil {
@@ -173,22 +175,30 @@ Work:
 	goto Work
 }
 
-// Incrementally prints status updates
+// Intermittently reports data to our server. Prints a log message for each report sent.
 func (c *Crawler) reporter() {
-	var elapsed int = 0
+	var elapsed uint = 0
+	interval := time.Duration(c.reportInterval) * time.Second
 	for {
 		select {
-		case <-time.After(10 * time.Second):
-			elapsed += 10
-			fmt.Printf("--- %d unique peers", len(c.report.IDs))
-			if elapsed == 60 {
+		case <-time.After(interval):
+			elapsed += c.reportInterval
+
+			results, response := c.publishResults()
+
+			if elapsed/60 == 1 {
 				// This is very important
-				fmt.Printf("; time elapsed: %d minute\n", elapsed/60)
-			} else if elapsed%60 == 0 {
-				fmt.Printf("; time elapsed: %d minutes\n", elapsed/60)
+				fmt.Printf("--- Time elapsed: %d minute ---\n", elapsed/60)
 			} else {
-				fmt.Printf("\n")
+				fmt.Printf("--- Time elapsed: %d minutes ---\n", elapsed/60)
 			}
+
+			fmt.Printf("%d peers reporting:\n", results.reporters)
+			fmt.Printf("- %d unique peer IDs -\n", results.uniquePeers)
+			fmt.Printf("- %d peers with a valid IP+port -\n", results.peersWithIPs)
+			fmt.Printf("- %d unique IP+port combinations -\n", results.uniqueTargets)
+			fmt.Printf("Sent report to (%s) and got response: %s\n", Server, response)
+			fmt.Printf("---\n")
 		case <-c.ctx.Done():
 			return
 		}
@@ -207,140 +217,151 @@ func (c *Crawler) aggregator() {
 			continue
 		}
 
-		// Skip responses from our node
-		if self.String() == report.ID.String() {
+		// Get reporting peer and the IDs they reported
+		reporter := report.ID
+		response := filterSelf(self, report)
+
+		// No responses? Skip!
+		if len(response) == 0 {
 			continue
 		}
 
-		// Filter out responses - we don't want our own node
-		queryResponses := filterSelf(self, report.Responses)
-		// No remaining responses? Skip.
-		if len(queryResponses) == 0 {
-			continue
-		}
-
-		seenID := map[peer.ID]struct{}{}
+		// Which IDs this reporter has reported
 		var reportedIDs []peer.ID
-		// Iterate over existing results and track which IDs we've seen:
-		for _, id := range c.report.IDs[report.ID] {
-			// Filter dupes
-			if _, exists := seenID[id]; !exists {
-				seenID[id] = struct{}{}
-				reportedIDs = append(reportedIDs, id)
+		// Which peer+IPs this reporter has reported
+		allReportedIPs := make(map[peer.ID][]string)
+
+		// Iterate over previously-reported peers, and track what we've seen:
+		seenID := map[peer.ID]struct{}{}
+		c.report.mu.Lock()
+		for _, peer := range c.report.IDs[reporter] {
+			// Filter duplicates
+			if _, seen := seenID[peer]; !seen {
+				seenID[peer] = struct{}{}
+				reportedIDs = append(reportedIDs, peer)
 			}
 		}
+		c.report.mu.Unlock()
 
-		// Response: AddrInfo { ID peer.ID; Addrs []MultiAddr }
-		for _, r := range queryResponses {
-			// Filter dupes
-			if _, exists := seenID[r.ID]; !exists {
-				seenID[r.ID] = struct{}{}
-				reportedIDs = append(reportedIDs, r.ID)
+		// Iterate over the newly-reported peers+IPs:
+		for _, peerInfo := range response {
+			// Filter duplicates
+			if _, seen := seenID[peerInfo.ID]; !seen {
+				seenID[peerInfo.ID] = struct{}{}
+				reportedIDs = append(reportedIDs, peerInfo.ID)
 			}
 
 			// Filter response multiaddrs for IP+port combinations
-			responseIPs := filterIPs(r.Addrs)
+			responseIPs := filterIPs(peerInfo.Addrs)
 			if len(responseIPs) == 0 {
 				continue // found nothing; skip
 			}
 
-			seenIP := map[string]struct{}{}
+			// Which IPs we know for this peer
 			var reportedIPs []string
-			// Iterate over existing IPs and track which ones we've seen:
-			for _, ip := range c.report.IPs[r.ID] {
-				// Filter dupes
-				if _, exists := seenIP[ip]; !exists {
+
+			// Iterate over previously-reported IPs, and track what we've seen:
+			seenIP := map[string]struct{}{}
+			c.report.mu.Lock()
+			for _, ip := range c.report.IPs[peerInfo.ID] {
+				// Filter duplicates
+				if _, seen := seenIP[ip]; !seen {
 					seenIP[ip] = struct{}{}
 					reportedIPs = append(reportedIPs, ip)
 				}
 			}
+			c.report.mu.Unlock()
 
-			// Now, add newly-reported IPs to our report:
+			// Iterate over newly-reported IPs:
 			for _, ip := range responseIPs {
-				if _, exists := seenIP[ip]; !exists {
+				// Filter duplicates
+				if _, seen := seenIP[ip]; !seen {
 					seenIP[ip] = struct{}{}
 					reportedIPs = append(reportedIPs, ip)
 				}
 			}
 
 			if len(reportedIPs) != 0 {
-				c.report.IPs[r.ID] = reportedIPs
+				allReportedIPs[peerInfo.ID] = reportedIPs
+			}
+		}
+
+		// Do our writes, locking the map for reads
+		c.report.mu.RLock()
+		for peer, ips := range allReportedIPs {
+			if len(ips) != 0 {
+				c.report.IPs[peer] = ips
 			}
 		}
 
 		if len(reportedIDs) != 0 {
-			c.report.IDs[report.ID] = reportedIDs
+			c.report.IDs[reporter] = reportedIDs
 		}
+		// Unlock map for reads
+		c.report.mu.RUnlock()
 	}
 }
 
-// Do a final pass over our reporter IDs and check the DHT PeerStore to see
-// if we know of any additional IPs for them
-func (c *Crawler) finalizeReport() {
-	fmt.Println("Finalizing report...")
-	pStore := c.host.Peerstore()
-
-	for id := range c.report.IDs {
-		// Try and find addresses for this peer
-		addrs := pStore.Addrs(id)
-
-		// Filter for ip+port combinations
-		reporterIPs := filterIPs(addrs)
-		if len(reporterIPs) == 0 {
-			continue // found nothing; skip :(
-		}
-
-		seenIP := map[string]struct{}{}
-		var resultIPs []string
-		// Iterate over existing IPs and track what we've seen:
-		for _, ip := range c.report.IPs[id] {
-			// Filter dupes
-			if _, exists := seenIP[ip]; !exists {
-				seenIP[ip] = struct{}{}
-				resultIPs = append(resultIPs, ip)
-			}
-		}
-
-		// Now, add newly-filtered IPs to our report:
-		for _, ip := range reporterIPs {
-			// Filter dupes
-			if _, exists := seenIP[ip]; !exists {
-				seenIP[ip] = struct{}{}
-				resultIPs = append(resultIPs, ip)
-			}
-		}
-
-		if len(resultIPs) != 0 {
-			c.report.IPs[id] = resultIPs
-		}
-	}
+type Results struct {
+	reporters     uint // Number of peers that responded to our queries
+	uniquePeers   uint // Number of peers that we have an ID for
+	peersWithIPs  uint // Number of peers we have an IP address for
+	uniqueTargets uint // Number of unique IP+port combinations we have
 }
 
 // Send c.report to server
-func (c *Crawler) publishResults() {
-	fmt.Printf("Sending results to server at %s\n", Server)
-
-	results := &ReportJSON{
+func (c *Crawler) publishResults() (Results, string) {
+	reportJSON := &ReportJSON{
 		IDs: make(map[string][]string),
 		IPs: make(map[string][]string),
 	}
 
+	results := &Results{}
+
+	seenID := map[peer.ID]struct{}{}
+	seenIP := map[string]struct{}{}
+
 	// Prettyify reported IDs and add to results
+	c.report.mu.Lock()
 	for source, targets := range c.report.IDs {
+		// Tally number of reporters and unique peer IDs
+		if _, seen := seenID[source]; !seen {
+			seenID[source] = struct{}{}
+			results.reporters++
+			results.uniquePeers++
+		}
+
 		targetsPretty := make([]string, 0)
 		for _, target := range targets {
+			// Tally unique peer IDs
+			if _, seen := seenID[target]; !seen {
+				seenID[target] = struct{}{}
+				results.uniquePeers++
+			}
+
 			targetsPretty = append(targetsPretty, target.Pretty())
 		}
 
-		results.IDs[source.Pretty()] = targetsPretty
+		reportJSON.IDs[source.Pretty()] = targetsPretty
 	}
 
 	// Prettyify reported target IDs and add to results
-	for peer, addrs := range c.report.IPs {
-		results.IPs[peer.Pretty()] = addrs
-	}
+	for peer, ips := range c.report.IPs {
+		results.peersWithIPs++
 
-	reportBody, err := json.Marshal(results)
+		// Tally unique IP+port combinations
+		for _, ip := range ips {
+			if _, seen := seenIP[ip]; !seen {
+				seenIP[ip] = struct{}{}
+				results.uniqueTargets++
+			}
+		}
+
+		reportJSON.IPs[peer.Pretty()] = ips
+	}
+	c.report.mu.Unlock()
+
+	reportBody, err := json.Marshal(reportJSON)
 	if err != nil {
 		panic(err) // not even gonna try and recover lol
 	}
@@ -357,7 +378,7 @@ func (c *Crawler) publishResults() {
 		panic(err)
 	}
 
-	fmt.Println(string(body))
+	return *results, string(body)
 }
 
 // Iterates over a collection of multiaddrs and attempts to find ip+port combos
@@ -410,8 +431,16 @@ func filterIPs(addrs []ma.Multiaddr) []string {
 }
 
 // Filter DHT query responses that contain our own peer ID
-func filterSelf(self peer.ID, responsesRaw []*peer.AddrInfo) []*peer.AddrInfo {
+func filterSelf(self peer.ID, report *routing.QueryEvent) []*peer.AddrInfo {
 	var res []*peer.AddrInfo = make([]*peer.AddrInfo, 0)
+
+	// We don't want reports from our own node
+	if report.ID == self {
+		return res
+	}
+
+	// We also don't want reports that contain our own node
+	responsesRaw := report.Responses
 	for _, info := range responsesRaw {
 		if info.ID.String() != self.String() {
 			res = append(res, info)
@@ -432,7 +461,7 @@ func main() {
 	// Parse CLI flags
 	flag.Parse()
 
-	crawler := NewCrawler()
+	crawler := NewCrawler(*reportInterval)
 	crawler.start(Workers)
 
 	// Create a channel that will be notified of os.Interrupt or os.Kill signals
@@ -440,15 +469,10 @@ func main() {
 	ch := make(chan os.Signal, 1)
 	signal.Notify(ch, os.Interrupt, os.Kill)
 
-	// 5 minute default run
-	var dur uint = 5
-	if *duration != 0 {
-		dur = *duration
-	}
-
 	// Calculate total runtime
-	totalDuration := time.Duration(dur) * 60 * time.Second
-	fmt.Printf("(Running %d minute crawl)\n", dur)
+	totalDuration := time.Duration(*duration) * 60 * time.Second
+	fmt.Printf("Running %d minute crawl\n", *duration)
+	fmt.Printf("Posting results every %d seconds\n", *reportInterval)
 	select {
 	case <-time.After(totalDuration):
 		crawler.close()

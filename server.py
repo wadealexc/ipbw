@@ -22,9 +22,7 @@ def read_index():
     return "Hello, crawlers!"
 
 @app.post("/crawl")
-async def post_crawl_results(result: CrawlResult):    
-    print(len(result.IDs))
-    print(len(result.IPs))
+async def post_crawl_results(result: CrawlResult):
     res_ids = await db.peer_ids.insert_one(result.IDs)
     res_ips = await db.peer_ips.insert_one(result.IPs)
     return "Inserted %d IDs and %d IPs" % (len(result.IDs), len(result.IPs))
