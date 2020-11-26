@@ -17,7 +17,7 @@ class CrawlResult(BaseModel):
     IDs: Dict[str, Sequence[str]]
     IPs: Dict[str, Sequence[str]]
 
-@app.get("/")
+@app.get("/ping")
 def read_index():
     return "Hello, crawlers!"
 

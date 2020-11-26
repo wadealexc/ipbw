@@ -34,6 +34,9 @@ const Workers = 8
 // Server is the location to which the crawler reports runs to
 const Server = "http://127.0.0.1:8000/crawl"
 
+// ServerPing is an endpoint we ping on crawler creation to make sure the server is running
+const ServerPing = "http://127.0.0.1:8000/ping"
+
 var (
 	duration       = flag.Uint("d", 5, "(Optional) Number of minutes to crawl. 5 minutes by default.")
 	reportInterval = flag.Uint("i", 60, "(Optional) Number of seconds between updates sent to the server. 60s by default.")
@@ -78,6 +81,9 @@ type ReportJSON struct {
 func NewCrawler(reportInterval uint) *Crawler {
 	fmt.Println("IPBW: Starting crawler")
 
+	// Make sure server is up
+	pingServer()
+
 	// Create a context that, when passed to DHT queries, emits QueryEvents to this channel
 	ctx, cancel := context.WithCancel(context.Background())
 	ctx, events := routing.RegisterForQueryEvents(ctx)
@@ -95,6 +101,23 @@ func NewCrawler(reportInterval uint) *Crawler {
 
 	c.initHost()
 	return c
+}
+
+func pingServer() {
+	resp, err := http.Get(ServerPing)
+	if err != nil {
+		fmt.Println("Expected response from server. Is it running?")
+		panic(err)
+	}
+
+	defer resp.Body.Close()
+
+	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		panic(err)
+	}
+
+	fmt.Printf("Server says: %s\n", string(body))
 }
 
 // Start our libp2p node
