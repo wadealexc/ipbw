@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"io/ioutil"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -406,7 +407,30 @@ func filterIPs(addrs []ma.Multiaddr) []string {
 					// Skip localhost
 					break
 				}
-				res = fields[i+1]
+
+				ipRaw := fields[i+1]
+
+				// If we parsed a DNS address, we're done
+				if field == "dns4" || field == "dns6" || field == "dnsaddr" {
+					res = ipRaw
+					ipFound = true
+					break
+				}
+
+				// For IPv4 / IPv6 addresses, filter out private / local / loopback IPs
+				ip := net.ParseIP(ipRaw)
+				switch {
+				case ip == nil:
+					fmt.Printf("Invalid IP address in %s: %s; skipping\n", addr.String(), res)
+					break
+				case ip.IsUnspecified(), ip.IsLoopback(), ip.IsInterfaceLocalMulticast():
+					break
+				case ip.IsLinkLocalMulticast(), ip.IsLinkLocalUnicast():
+					break
+				}
+
+				// Nice, we're done!
+				res = ipRaw
 				ipFound = true
 			} else if field == "udp" || field == "tcp" { // found port
 				if res == "" {
