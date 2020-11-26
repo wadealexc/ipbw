@@ -222,7 +222,6 @@ func (c *Crawler) reporter() {
 			fmt.Printf("- %d peers with a valid IP+port -\n", results.peersWithIPs)
 			fmt.Printf("- %d unique IP+port combinations -\n", results.uniqueTargets)
 			fmt.Printf("Sent report to (%s) and got response: %s\n", Server, response)
-			fmt.Printf("---\n")
 		case <-c.ctx.Done():
 			return
 		}
@@ -326,6 +325,7 @@ func (c *Crawler) aggregator() {
 	}
 }
 
+// Results holds printable metrics about our crawl
 type Results struct {
 	reporters     uint // Number of peers that responded to our queries
 	uniquePeers   uint // Number of peers that we have an ID for
@@ -348,10 +348,11 @@ func (c *Crawler) publishResults() (Results, string) {
 	// Prettyify reported IDs and add to results
 	c.report.mu.Lock()
 	for source, targets := range c.report.IDs {
-		// Tally number of reporters and unique peer IDs
+		results.reporters++
+
+		// Tally unique peer IDs
 		if _, seen := seenID[source]; !seen {
 			seenID[source] = struct{}{}
-			results.reporters++
 			results.uniquePeers++
 		}
 
@@ -372,6 +373,12 @@ func (c *Crawler) publishResults() (Results, string) {
 	// Prettyify reported target IDs and add to results
 	for peer, ips := range c.report.IPs {
 		results.peersWithIPs++
+
+		// Tally unique peer IDs
+		if _, seen := seenID[peer]; !seen {
+			seenID[peer] = struct{}{}
+			results.uniquePeers++
+		}
 
 		// Tally unique IP+port combinations
 		for _, ip := range ips {

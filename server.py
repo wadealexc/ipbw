@@ -25,4 +25,4 @@ def read_index():
 async def post_crawl_results(result: CrawlResult):
     res_ids = await db.peer_ids.insert_one(result.IDs)
     res_ips = await db.peer_ips.insert_one(result.IPs)
-    return "Inserted %d IDs and %d IPs" % (len(result.IDs), len(result.IPs))
+    return "Inserted %d IDs and %d IPs" % (len(result.IDs) - 1, len(result.IPs) - 1)
