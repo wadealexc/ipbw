@@ -13,9 +13,14 @@ db = client[DB_NAME]
 
 app = FastAPI()
 
+class Peer(BaseModel):
+    pid: str
+    ips: Sequence[str]
+    neighbors: Sequence[str]
+    timestamp: str
+
 class CrawlResult(BaseModel):
-    IDs: Dict[str, Sequence[str]]
-    IPs: Dict[str, Sequence[str]]
+    peers: Sequence[Peer]
 
 @app.get("/ping")
 def read_index():
@@ -23,6 +28,15 @@ def read_index():
 
 @app.post("/crawl")
 async def post_crawl_results(result: CrawlResult):
-    res_ids = await db.peer_ids.insert_one(result.IDs)
-    res_ips = await db.peer_ips.insert_one(result.IPs)
-    return "Inserted %d IDs and %d IPs" % (len(result.IDs) - 1, len(result.IPs) - 1)
+    num_reachable = 0
+    num_targets = 0
+    for peer in result.peers:
+        if len(peer.ips) != 0:
+            num_reachable += 1
+            num_targets += len(peer.ips)
+
+    return "%d reachable with %d total unique targets!" % (num_reachable, num_targets)
+
+    # res_ids = await db.peer_ids.insert_one(result.IDs)
+    # res_ips = await db.peer_ips.insert_one(result.IPs)
+    # return "Inserted %d IDs and %d IPs" % (len(result.IDs) - 1, len(result.IPs) - 1)
