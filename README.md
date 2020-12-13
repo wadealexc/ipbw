@@ -3,20 +3,18 @@ IPBW: Interplanetary Black Widow crawls ur ipfs nodes
 
 ## About
 
-IPBW uses `go-libp2p` and `go-libp2p-kad-dht` to crawl the IPFS network. IPBW spawns workers to generate random peer IDs and execute DHT queries to connected peers. The DHT uses an XOR distance calculation to select up to K connected peers to query for each random peer ID. Peers respond with their own connected peers within a certain distance of the requested random peer ID.
+IPBW uses `go-libp2p` and `go-libp2p-kad-dht` to crawl the IPFS network. IPBW spawns workers to generate random peer IDs and execute DHT queries to connected peers. The DHT uses an XOR distance calculation to select up to K connected peers to query for each random peer ID. Peers respond with their own connected peers within a certain distance of the requested random peer ID. Over time, recursive queries to discovered peers enumerate the network.
 
-Over time, recursive queries to discovered peers enumerate the network.
+IPBW contains both a server (`server.py`) and crawler implementation (`crawler.go`).
 
 ## Usage
 
-`./ipbw -d=<duration>`
+`./ipbw -d=<duration> -i=<report interval>`
 
 * [Optional] Use -d to specify the number of minutes to crawl for
-    * By default, the crawler runs until it receives an interrupt
-
-IPBW creates 2 files on termination:
-* `peerIDs.csv`: stores IDs of discovered peers, along with the ID of the peer who responded to our query. Records take the form: "pOrigin,pResponse" ... where each field is a peer ID
-* `peerIPs.csv`: stores IPv4/IPv6/DNS4/DNS6 addresses of peers, along with the ID of the peer located at that address. Records take the form: "pID,ip:port"
+    * By default, the crawler runs for 5 minutes
+* [Optional] Use -i to specify the number of seconds between posts to the server
+    * By default, the crawler reports every 60 seconds
 
 ## Output
 

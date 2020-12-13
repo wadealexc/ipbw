@@ -1,5 +1,6 @@
 /dht.db
 peerIDs.csv
 peerIPs.csv
-ipbw
 __pycache__/
+.vscode/
+.elixir_ls/

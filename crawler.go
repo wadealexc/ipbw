@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"io/ioutil"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -33,6 +34,9 @@ const Workers = 8
 // Server is the location to which the crawler reports runs to
 const Server = "http://127.0.0.1:8000/crawl"
 
+// ServerPing is an endpoint we ping on crawler creation to make sure the server is running
+const ServerPing = "http://127.0.0.1:8000/ping"
+
 var (
 	duration       = flag.Uint("d", 5, "(Optional) Number of minutes to crawl. 5 minutes by default.")
 	reportInterval = flag.Uint("i", 60, "(Optional) Number of seconds between updates sent to the server. 60s by default.")
@@ -50,6 +54,7 @@ type Crawler struct {
 	events         <-chan *routing.QueryEvent
 	report         *Report // Result aggregator
 	reportInterval uint    // How often a report is sent to the server
+	numReporters   uint    // Number of unique peers reporting neighbors
 
 	// Context and cancel function passed to DHT queries
 	ctx    context.Context
@@ -57,25 +62,48 @@ type Crawler struct {
 	wg     sync.WaitGroup
 }
 
+// Peer contains all the info we know for a given peer
+type Peer struct {
+	ips       []string  // All known IPs/ports for this peer
+	neighbors []peer.ID // All neighbors this peer reported to us
+	timestamp string    // The UTC timestamp when we discovered the peer
+}
+
 // Report aggregates results from QueryEvents
 // IDs maps a reporter peer to the peer IDs they told us about
 // IPs maps a peer's ID to known IP addresses at which they can be found
 type Report struct {
-	mu  sync.RWMutex
-	IDs map[peer.ID][]peer.ID
-	IPs map[peer.ID][]string
+	mu    sync.RWMutex
+	peers map[peer.ID]*Peer
+}
+
+// IDs maps a reporter peer to the peer IDs they told us about
+// IPs maps a peer's ID to known IP addresses at which they can be found
+// type Report struct:
+// 	mu  sync.RWMutex
+// 	IDs map[peer.ID][]peer.ID
+// 	IPs map[peer.ID][]string
+
+// PeerJSON is a json-marshallable form of Peer (with an added pid field)
+type PeerJSON struct {
+	Pid       string   `json:"pid"`
+	Ips       []string `json:"ips"`
+	Neighbors []string `json:"neighbors"`
+	Timestamp string   `json:"timestamp"`
 }
 
 // ReportJSON is a json-marshallable form of Report
 type ReportJSON struct {
-	IDs map[string][]string
-	IPs map[string][]string
+	Peers []PeerJSON `json:"peers"`
 }
 
 // NewCrawler creates an IPFS crawler and starts our libp2p node.
 // TODO: Ping server here to see if it's running
 func NewCrawler(reportInterval uint) *Crawler {
 	fmt.Println("IPBW: Starting crawler")
+
+	// Make sure server is up
+	pingServer()
 
 	// Create a context that, when passed to DHT queries, emits QueryEvents to this channel
 	ctx, cancel := context.WithCancel(context.Background())
@@ -87,13 +115,29 @@ func NewCrawler(reportInterval uint) *Crawler {
 		events:         events,
 		reportInterval: reportInterval,
 		report: &Report{
-			IDs: make(map[peer.ID][]peer.ID),
-			IPs: make(map[peer.ID][]string),
+			peers: make(map[peer.ID]*Peer),
 		},
 	}
 
 	c.initHost()
 	return c
+}
+
+func pingServer() {
+	resp, err := http.Get(ServerPing)
+	if err != nil {
+		fmt.Println("Expected response from server. Is it running?")
+		panic(err)
+	}
+
+	defer resp.Body.Close()
+
+	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		panic(err)
+	}
+
+	fmt.Printf("Server says: %s\n", string(body))
 }
 
 // Start our libp2p node
@@ -198,7 +242,6 @@ func (c *Crawler) reporter() {
 			fmt.Printf("- %d peers with a valid IP+port -\n", results.peersWithIPs)
 			fmt.Printf("- %d unique IP+port combinations -\n", results.uniqueTargets)
 			fmt.Printf("Sent report to (%s) and got response: %s\n", Server, response)
-			fmt.Printf("---\n")
 		case <-c.ctx.Done():
 			return
 		}
@@ -217,91 +260,102 @@ func (c *Crawler) aggregator() {
 			continue
 		}
 
-		// Get reporting peer and the IDs they reported
+		// Get reporting peer, the IDs/Addrs they reported, and a timestamp
 		reporter := report.ID
 		response := filterSelf(self, report)
+		timestamp := time.Now().UTC().String()
 
 		// No responses? Skip!
 		if len(response) == 0 {
 			continue
 		}
 
-		// Which IDs this reporter has reported
-		var reportedIDs []peer.ID
-		// Which peer+IPs this reporter has reported
-		allReportedIPs := make(map[peer.ID][]string)
+		c.report.mu.RLock() // Lock for reads/writes
 
-		// Iterate over previously-reported peers, and track what we've seen:
-		seenID := map[peer.ID]struct{}{}
-		c.report.mu.Lock()
-		for _, peer := range c.report.IDs[reporter] {
-			// Filter duplicates
-			if _, seen := seenID[peer]; !seen {
-				seenID[peer] = struct{}{}
-				reportedIDs = append(reportedIDs, peer)
+		// Check if this reporter exists in our report yet. If not, create an entry:
+		if _, exists := c.report.peers[reporter]; !exists {
+			c.numReporters++
+			c.report.peers[reporter] = &Peer{
+				ips:       make([]string, 0), // TODO we can probably query our PeerStore here
+				neighbors: make([]peer.ID, 0),
+				timestamp: timestamp,
 			}
 		}
-		c.report.mu.Unlock()
 
-		// Iterate over the newly-reported peers+IPs:
+		// We need to update our reporter's neighbors with the IDs they just gave us.
+		// First, figure out what neighbors we already know about:
+		seenID := map[peer.ID]struct{}{}
+		neighbors := make([]peer.ID, 0)
+
+		// Range over already-known neighbors
+		for _, neighbor := range c.report.peers[reporter].neighbors {
+			// Record as neighbor and filter duplicates
+			if _, seen := seenID[neighbor]; !seen {
+				seenID[neighbor] = struct{}{}
+				neighbors = append(neighbors, neighbor)
+			}
+		}
+
+		// Next, for each newly-reported neighbor:
+		// 1. Record them as one of our reporter's neighbors
+		// 2. Add them to c.report.peers if they don't exist yet
+		// 3. Update their report entry with the new IPs we have for them
 		for _, peerInfo := range response {
-			// Filter duplicates
+			// 1. Record as neighbor and filter duplicates
 			if _, seen := seenID[peerInfo.ID]; !seen {
 				seenID[peerInfo.ID] = struct{}{}
-				reportedIDs = append(reportedIDs, peerInfo.ID)
+				neighbors = append(neighbors, peerInfo.ID)
 			}
 
-			// Filter response multiaddrs for IP+port combinations
-			responseIPs := filterIPs(peerInfo.Addrs)
-			if len(responseIPs) == 0 {
-				continue // found nothing; skip
+			// 2. If we haven't seen this peer yet, create an entry for them
+			if _, exists := c.report.peers[peerInfo.ID]; !exists {
+				c.report.peers[peerInfo.ID] = &Peer{
+					ips:       make([]string, 0),
+					neighbors: []peer.ID{reporter}, // Our reporter is the first neighbor
+					timestamp: timestamp,
+				}
 			}
 
-			// Which IPs we know for this peer
-			var reportedIPs []string
-
-			// Iterate over previously-reported IPs, and track what we've seen:
+			// 3. Update report entry with the new IPs we have for them
+			// First, figure out what IPs we already know about:
 			seenIP := map[string]struct{}{}
-			c.report.mu.Lock()
-			for _, ip := range c.report.IPs[peerInfo.ID] {
+			knownIPs := make([]string, 0)
+
+			// Range over already-known IPs
+			for _, ip := range c.report.peers[peerInfo.ID].ips {
 				// Filter duplicates
 				if _, seen := seenIP[ip]; !seen {
 					seenIP[ip] = struct{}{}
-					reportedIPs = append(reportedIPs, ip)
+					knownIPs = append(knownIPs, ip)
 				}
 			}
-			c.report.mu.Unlock()
 
-			// Iterate over newly-reported IPs:
-			for _, ip := range responseIPs {
+			// Range over newly-reported IPs
+			for _, ip := range filterIPs(peerInfo.Addrs) {
 				// Filter duplicates
 				if _, seen := seenIP[ip]; !seen {
 					seenIP[ip] = struct{}{}
-					reportedIPs = append(reportedIPs, ip)
+					knownIPs = append(knownIPs, ip)
 				}
 			}
 
-			if len(reportedIPs) != 0 {
-				allReportedIPs[peerInfo.ID] = reportedIPs
+			// Finally, add this peer's known IPs to the report:
+			if len(knownIPs) != 0 {
+				c.report.peers[peerInfo.ID].ips = knownIPs
 			}
 		}
 
-		// Do our writes, locking the map for reads
-		c.report.mu.RLock()
-		for peer, ips := range allReportedIPs {
-			if len(ips) != 0 {
-				c.report.IPs[peer] = ips
-			}
+		// Finally finally, record our reporter's neighbors
+		if len(neighbors) != 0 {
+			c.report.peers[reporter].neighbors = neighbors
 		}
 
-		if len(reportedIDs) != 0 {
-			c.report.IDs[reporter] = reportedIDs
-		}
 		// Unlock map for reads
 		c.report.mu.RUnlock()
 	}
 }
 
+// Results holds printable metrics about our crawl
 type Results struct {
 	reporters     uint // Number of peers that responded to our queries
 	uniquePeers   uint // Number of peers that we have an ID for
@@ -312,52 +366,55 @@ type Results struct {
 // Send c.report to server
 func (c *Crawler) publishResults() (Results, string) {
 	reportJSON := &ReportJSON{
-		IDs: make(map[string][]string),
-		IPs: make(map[string][]string),
+		Peers: make([]PeerJSON, 0),
 	}
 
-	results := &Results{}
+	results := &Results{
+		reporters: c.numReporters,
+	}
 
+	// This will be used to calculate the number of unique peers
 	seenID := map[peer.ID]struct{}{}
-	seenIP := map[string]struct{}{}
 
-	// Prettyify reported IDs and add to results
+	// Iterate over report and convert to ReportJSON
 	c.report.mu.Lock()
-	for source, targets := range c.report.IDs {
-		// Tally number of reporters and unique peer IDs
-		if _, seen := seenID[source]; !seen {
-			seenID[source] = struct{}{}
-			results.reporters++
+	for pid, peer := range c.report.peers {
+
+		// Add unique peer
+		if _, seen := seenID[pid]; !seen {
+			seenID[pid] = struct{}{}
 			results.uniquePeers++
 		}
 
-		targetsPretty := make([]string, 0)
-		for _, target := range targets {
-			// Tally unique peer IDs
-			if _, seen := seenID[target]; !seen {
-				seenID[target] = struct{}{}
+		// If we have IPs for this peer, tally those
+		// This branch is independent from uniqueness tally, because we may have seen
+		// this peer in another peer's neighbors, but this is definitely the only place
+		// we've seen this peer's IPs
+		if len(peer.ips) != 0 {
+			results.peersWithIPs++
+			results.uniqueTargets += uint(len(peer.ips))
+		}
+
+		// Convert neighbor IDs to strings
+		neighborStrings := make([]string, 0)
+		for _, neighbor := range peer.neighbors {
+			// While we're at it, tally unique peers:
+			if _, seen := seenID[neighbor]; !seen {
 				results.uniquePeers++
 			}
 
-			targetsPretty = append(targetsPretty, target.Pretty())
+			neighborStrings = append(neighborStrings, neighbor.Pretty())
 		}
 
-		reportJSON.IDs[source.Pretty()] = targetsPretty
-	}
-
-	// Prettyify reported target IDs and add to results
-	for peer, ips := range c.report.IPs {
-		results.peersWithIPs++
-
-		// Tally unique IP+port combinations
-		for _, ip := range ips {
-			if _, seen := seenIP[ip]; !seen {
-				seenIP[ip] = struct{}{}
-				results.uniqueTargets++
-			}
+		// Convert peer to PeerJSON
+		peerJSON := PeerJSON{
+			Pid:       pid.Pretty(),
+			Ips:       peer.ips,
+			Neighbors: neighborStrings,
+			Timestamp: peer.timestamp,
 		}
 
-		reportJSON.IPs[peer.Pretty()] = ips
+		reportJSON.Peers = append(reportJSON.Peers, peerJSON)
 	}
 	c.report.mu.Unlock()
 
@@ -406,7 +463,30 @@ func filterIPs(addrs []ma.Multiaddr) []string {
 					// Skip localhost
 					break
 				}
-				res = fields[i+1]
+
+				ipRaw := fields[i+1]
+
+				// If we parsed a DNS address, we're done
+				if field == "dns4" || field == "dns6" || field == "dnsaddr" {
+					res = ipRaw
+					ipFound = true
+					break
+				}
+
+				// For IPv4 / IPv6 addresses, filter out private / local / loopback IPs
+				ip := net.ParseIP(ipRaw)
+				switch {
+				case ip == nil:
+					fmt.Printf("Invalid IP address in %s: %s; skipping\n", addr.String(), res)
+					break
+				case ip.IsUnspecified(), ip.IsLoopback(), ip.IsInterfaceLocalMulticast():
+					break
+				case ip.IsLinkLocalMulticast(), ip.IsLinkLocalUnicast():
+					break
+				}
+
+				// Nice, we're done!
+				res = ipRaw
 				ipFound = true
 			} else if field == "udp" || field == "tcp" { // found port
 				if res == "" {
