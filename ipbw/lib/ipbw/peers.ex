@@ -73,6 +73,12 @@ defmodule Ipbw.Peers do
     |> Repo.update()
   end
 
+  # def upsert_peer(%Peer{} = peer, attrs) do
+  #   peer
+  #   |> Peer.changeset(attrs)
+  #   |> Repo.
+  # end
+
   @doc """
   Deletes a peer.
 
