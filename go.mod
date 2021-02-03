@@ -15,6 +15,8 @@ require (
 	github.com/libp2p/go-libp2p-peerstore v0.2.6
 	github.com/multiformats/go-multiaddr v0.3.1
 	github.com/multiformats/go-multihash v0.0.14
+	github.com/urfave/cli v1.22.5
+	github.com/urfave/cli/v2 v2.3.0
 	go.uber.org/fx v1.13.1
 	go.uber.org/zap v1.16.0
 	google.golang.org/api v0.38.0 // indirect
