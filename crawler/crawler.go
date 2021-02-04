@@ -38,6 +38,9 @@ type Crawler struct {
 	WorkerCtx    context.Context
 	WorkerCancel context.CancelFunc
 
+	// Used by modules to receive Events from the crawl
+	Listeners []context.Context
+
 	*Report
 	NumWorkers uint
 }
@@ -65,6 +68,7 @@ func NewCrawler(params crawlerParams, lc fx.Lifecycle) (*Crawler, error) {
 		Events:       events,
 		WorkerCtx:    WorkerCtx,
 		WorkerCancel: WorkerCancel,
+		Listeners:    make([]context.Context, 0),
 	}
 
 	lc.Append(fx.Hook{
@@ -89,6 +93,14 @@ func (c *Crawler) SetNumWorkers(numWorkers uint) error {
 	}
 	c.NumWorkers = numWorkers
 	return nil
+}
+
+// AddListener adds a listener to the crawler
+// The returned channel will emit events from the crawl
+func (c *Crawler) AddListener(ctx context.Context) (context.Context, <-chan *Event) {
+	ctx, events := RegisterForEvents(ctx)
+	c.Listeners = append(c.Listeners, ctx)
+	return ctx, events
 }
 
 // Build the crawler: start libp2p node and open a DB for our DHT
@@ -196,7 +208,10 @@ func (c *Crawler) aggregator() {
 		}
 
 		if report.Type == routing.QueryError {
-			// fmt.Printf("Got QueryError: %s\n", report.Extra)
+			c.publish(&Event{
+				Type:  DHTQueryError,
+				Extra: report.Extra,
+			})
 			continue
 		} else if report.Type != routing.PeerResponse {
 			continue
@@ -227,6 +242,26 @@ func (c *Crawler) aggregator() {
 			c.Report.Peers[reporter].IsReporter = true
 		}
 
+		// Query our peerstore to see if we have additional IPs for our reporter
+		addrInfo := c.PS.PeerInfo(reporter)
+		reporterIPs := make([]string, 0)
+		seenIP := map[string]struct{}{}
+		for _, ip := range c.Report.Peers[reporter].Ips {
+			if _, seen := seenIP[ip]; !seen {
+				seenIP[ip] = struct{}{}
+				reporterIPs = append(reporterIPs, ip)
+			}
+		}
+
+		for _, ip := range c.filterIPs(addrInfo.Addrs) {
+			if _, seen := seenIP[ip]; !seen {
+				seenIP[ip] = struct{}{}
+				reporterIPs = append(reporterIPs, ip)
+			}
+		}
+
+		c.Report.Peers[reporter].Ips = reporterIPs
+
 		// We need to update our reporter's neighbors with the IDs they just gave us.
 		// First, figure out what neighbors we already know about:
 		seenID := map[peer.ID]struct{}{}
@@ -245,7 +280,9 @@ func (c *Crawler) aggregator() {
 		// Next, for each newly-reported neighbor:
 		// 1. Record them as one of our reporter's neighbors
 		// 2. Add them to c.report.peers if they don't exist yet
+		//    - Record newly-discovered peers so we can publish to any listeners
 		// 3. Update their report entry with the new IPs we have for them
+		newPeers := make([]peer.ID, 0)
 		for _, peerInfo := range response {
 			// 1. Record as neighbor and filter duplicates
 			if _, seen := seenID[peerInfo.ID]; !seen {
@@ -260,6 +297,7 @@ func (c *Crawler) aggregator() {
 					Neighbors: []peer.ID{reporter}, // Our reporter is the first neighbor
 					Timestamp: timestamp,
 				}
+				newPeers = append(newPeers, peerInfo.ID)
 			}
 
 			// 3. Update report entry with the new IPs we have for them
@@ -296,8 +334,23 @@ func (c *Crawler) aggregator() {
 			c.Report.Peers[reporter].Neighbors = neighbors
 		}
 
+		// Finally*3, publish an event with our newly-discovered peers
+		if len(newPeers) != 0 {
+			c.publish(&Event{
+				Type:  NewPeers,
+				Peers: newPeers,
+			})
+		}
+
 		// Unlock map for reads
 		c.Report.Mu.RUnlock()
+	}
+}
+
+// Iterates over registered listeners and publishes an event to each
+func (c *Crawler) publish(event *Event) {
+	for _, listener := range c.Listeners {
+		PublishEvent(listener, event)
 	}
 }
 

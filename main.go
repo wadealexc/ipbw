@@ -54,6 +54,12 @@ func main() {
 				Value:   1,
 				Usage:   "specify how often (in minutes) status updates will be posted",
 			},
+			&cli.BoolFlag{
+				Name:    "enhanced-interrogation",
+				Aliases: []string{"e"},
+				Value:   false,
+				Usage:   "enables the interrogator module",
+			},
 		},
 		Action: func(cctx *cli.Context) error {
 
@@ -72,6 +78,13 @@ func main() {
 				settings.modules = append(settings.modules, fx.Provide(modules.NewOutput))
 				settings.invokes = append(settings.invokes, fx.Invoke(func(o *modules.Output) error {
 					return o.SetInterval(cctx.Uint("output-interval"))
+				}))
+			}
+
+			if cctx.Bool("enhanced-interrogation") {
+				settings.modules = append(settings.modules, fx.Provide(modules.NewInterrogator))
+				settings.invokes = append(settings.invokes, fx.Invoke(func(i *modules.Interrogator) error {
+					return i.Subscribe()
 				}))
 			}
 
