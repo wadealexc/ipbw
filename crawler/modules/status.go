@@ -10,66 +10,69 @@ import (
 	"go.uber.org/fx"
 )
 
-// Output prints status updates to console
-type Output struct {
+// Status prints updates to console
+type Status struct {
 	*crawler.Crawler
-	Interval      time.Duration
-	PrinterCtx    context.Context
-	PrinterCancel context.CancelFunc
+
+	// How often status updates are printed
+	interval time.Duration
+	// Ctx / cancel for our worker
+	printerCtx    context.Context
+	printerCancel context.CancelFunc
 }
 
-type outputParams struct {
+type statusParams struct {
 	fx.In
 	*crawler.Crawler
 }
 
-// NewOutput creates an Output that will print occasional status updates to console
-func NewOutput(params outputParams, lc fx.Lifecycle) (*Output, error) {
+// NewStatus creates a Status that will print occasional updates to console
+func NewStatus(params statusParams, lc fx.Lifecycle) (*Status, error) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 
-	output := &Output{
+	status := &Status{
 		Crawler:       params.Crawler,
-		PrinterCtx:    ctx,
-		PrinterCancel: cancel,
+		printerCtx:    ctx,
+		printerCancel: cancel,
 	}
 
 	lc.Append(fx.Hook{
 		OnStart: func(context.Context) error {
-			return output.start()
+			return status.start()
 		},
 		OnStop: func(context.Context) error {
-			return output.stop()
+			return status.stop()
 		},
 	})
 
-	return output, nil
+	return status, nil
 }
 
 // SetInterval sets the duration between status updates printed to console
 // interval should be a number of minutes, which is converted to time.Duration here
-func (o *Output) SetInterval(interval uint) error {
+func (s *Status) SetInterval(interval uint) error {
 	if interval == 0 {
 		return fmt.Errorf("Expected nonzero interval")
 	}
-	o.Interval = time.Duration(interval) * time.Minute
+	s.interval = time.Duration(interval) * time.Minute
 	return nil
 }
 
-func (o *Output) start() error {
-	if o.Interval == 0 {
+func (s *Status) start() error {
+	if s.interval == 0 {
 		return fmt.Errorf("Interval not set")
 	}
 
-	go o.printer()
+	go s.printer()
 
 	return nil
 }
 
-func (o *Output) stop() error {
-	fmt.Printf("Stopping output...\n")
+func (s *Status) stop() error {
+	fmt.Printf("Stopping status...\n")
 
-	o.PrinterCancel()
+	s.printerCancel()
 	// Wait briefly to give the printer a chance to print one more time
 	// 5 seconds is the empirically-derived correct amount of time to wait:
 	waitFor := time.Duration(5) * time.Second
@@ -87,20 +90,20 @@ type results struct {
 	uniqueTargets uint // Number of unique IP+port combinations we have
 }
 
-func (o *Output) printer() {
+func (s *Status) printer() {
 	startTime := time.Now()
 	for {
 		// Check if we've been told to stop
-		if o.PrinterCtx.Err() != nil {
+		if s.printerCtx.Err() != nil {
 			return
 		}
 
 		select {
-		case <-time.After(o.Interval):
+		case <-time.After(s.interval):
 			timeElapsed := uint(time.Now().Sub(startTime).Minutes())
 
 			// Tally results
-			results := o.getResults()
+			results := s.getResults()
 
 			outputArr := make([]string, 0)
 			// VERY important to get this right or the whole world will burn
@@ -122,19 +125,19 @@ func (o *Output) printer() {
 }
 
 // Iterates over our report and retrieves printable metrics
-func (o *Output) getResults() *results {
+func (s *Status) getResults() *results {
 
-	o.Crawler.Report.Mu.Lock()
-	defer o.Crawler.Report.Mu.Unlock()
+	s.Crawler.Report.Mu.Lock()
+	defer s.Crawler.Report.Mu.Unlock()
 
 	results := &results{
-		uniquePeers: uint(len(o.Crawler.Report.Peers)),
+		uniquePeers: uint(len(s.Crawler.Report.Peers)),
 	}
 
 	// Track which IPs we've seen for unique target tally
 	seenIP := map[string]struct{}{}
 
-	for _, peer := range o.Crawler.Report.Peers {
+	for _, peer := range s.Crawler.Report.Peers {
 		if peer.IsReporter {
 			results.numReporters++
 		}

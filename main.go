@@ -7,8 +7,7 @@ import (
 	"os/signal"
 	"time"
 
-	"github.com/wadeAlexC/ipbw/crawler"
-	"github.com/wadeAlexC/ipbw/crawler/modules"
+	"github.com/wadeAlexC/ipbw/config"
 
 	"github.com/urfave/cli/v2"
 
@@ -31,73 +30,58 @@ func main() {
 		UseShortOptionHandling: true, // combine -o + -v -> -ov
 		Flags: []cli.Flag{
 			&cli.UintFlag{
-				Name:    "duration",
+				Name:    config.FlagCrawlDuration,
 				Aliases: []string{"d"},
 				Value:   5,
 				Usage:   "specify the number of minutes the crawler should run for",
 			},
 			&cli.UintFlag{
-				Name:    "num-workers",
+				Name:    config.FlagNumWorkers,
 				Aliases: []string{"n"},
 				Value:   8,
 				Usage:   "specify the number of goroutines used to query the DHT",
 			},
 			&cli.BoolFlag{
-				Name:    "output-status",
-				Aliases: []string{"o"},
+				Name:    config.FlagEnableStatus,
+				Aliases: []string{"s"},
 				Value:   true,
 				Usage:   "specify whether the crawler should output occasional status updates to console.",
 			},
 			&cli.UintFlag{
-				Name:    "output-interval",
-				Aliases: []string{"i"},
+				Name:    config.FlagStatusInterval,
+				Aliases: []string{"si"},
 				Value:   1,
 				Usage:   "specify how often (in minutes) status updates will be posted",
 			},
 			&cli.BoolFlag{
-				Name:    "enhanced-interrogation",
-				Aliases: []string{"e"},
+				Name:    config.FlagEnableIdentifier,
+				Aliases: []string{"i"},
 				Value:   false,
-				Usage:   "enables the interrogator module",
+				Usage:   "enables the identifier module",
 			},
 		},
 		Action: func(cctx *cli.Context) error {
 
-			settings := &settings{
-				modules: make([]fx.Option, 0),
-				invokes: make([]fx.Option, 0),
-			}
+			// Get default crawler config from cli flags
+			cfg := config.Default(cctx)
 
-			settings.modules = append(settings.modules, fx.Provide(crawler.NewCrawler))
-			settings.invokes = append(settings.invokes, fx.Invoke(func(c *crawler.Crawler) error {
-				return c.SetNumWorkers(cctx.Uint("num-workers"))
-			}))
+			// Get config for each module from cli flags:
+			cfg.ConfigStatus(cctx)     // modules/status
+			cfg.ConfigIdentifier(cctx) // modules/identifier
 
-			enableOutput := cctx.Bool("output-status")
-			if enableOutput {
-				settings.modules = append(settings.modules, fx.Provide(modules.NewOutput))
-				settings.invokes = append(settings.invokes, fx.Invoke(func(o *modules.Output) error {
-					return o.SetInterval(cctx.Uint("output-interval"))
-				}))
-			}
-
-			if cctx.Bool("enhanced-interrogation") {
-				settings.modules = append(settings.modules, fx.Provide(modules.NewInterrogator))
-				settings.invokes = append(settings.invokes, fx.Invoke(func(i *modules.Interrogator) error {
-					return i.Subscribe()
-				}))
-			}
+			// Print information about the crawl we're about to do
+			cfg.Hello()
 
 			app := fx.New(
-				fx.Options(settings.modules...),
-				fx.Options(settings.invokes...),
+				fx.Options(cfg.Modules...),
+				fx.Options(cfg.Invokes...),
 				fx.NopLogger, // Disable fx logging. Start/Stop will short-circuit if there are errors
 			)
 
-			fmt.Printf("Starting crawl with %d workers for %d minutes\n", cctx.Uint("num-workers"), cctx.Uint("duration"))
-
 			// Get crawl duration:
-			duration := time.Duration(cctx.Uint("duration")) * time.Minute
+			duration := time.Duration(cctx.Uint(config.FlagCrawlDuration)) * time.Minute
+
+			fmt.Printf("Starting crawl...\n")
 
 			if err := app.Start(context.Background()); err != nil {
 				return fmt.Errorf("Error starting app: %v", err)
@@ -124,27 +108,5 @@ func main() {
 
 	if err := app.Run(os.Args); err != nil {
 		panic(err) // burn it all to the ground
-	}
-}
-
-func defaults() []fx.Option {
-	return nil
-}
-
-type settings struct {
-	modules []fx.Option
-	invokes []fx.Option
-}
-
-type option func(*settings) error
-
-func options(opts ...option) option {
-	return func(s *settings) error {
-		for _, opt := range opts {
-			if err := opt(s); err != nil {
-				return err
-			}
-		}
-		return nil
 	}
 }

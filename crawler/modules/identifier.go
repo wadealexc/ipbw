@@ -13,15 +13,16 @@ import (
 	"go.uber.org/fx"
 )
 
-// Interrogator interrogates various suspects
-type Interrogator struct {
+type Identifier struct {
 	*crawler.Crawler
 
-	CrawlCancel context.CancelFunc
-	CrawlEvents <-chan *crawler.Event
+	// Events / cancel used to listen to crawler
+	crawlCancel context.CancelFunc
+	crawlEvents <-chan *crawler.Event
 
-	ICtx    context.Context
-	ICancel context.CancelFunc
+	// Ctx / cancel for our workers
+	iCtx    context.Context
+	iCancel context.CancelFunc
 
 	*report
 	supports map[peer.ID][]string
@@ -32,17 +33,14 @@ type report struct {
 	peers []peer.ID
 }
 
-type interrogatorParams struct {
+type identifierParams struct {
 	fx.In
 	*crawler.Crawler
 }
 
-// NewInterrogator creates an interrogator
-func NewInterrogator(params interrogatorParams, lc fx.Lifecycle) (*Interrogator, error) {
+func NewIdentifier(params identifierParams, lc fx.Lifecycle) (*Identifier, error) {
 
-	fmt.Printf("Interrogator is enabled\n")
-
-	i := &Interrogator{
+	i := &Identifier{
 		Crawler: params.Crawler,
 		report: &report{
 			peers: make([]peer.ID, 0),
@@ -62,32 +60,32 @@ func NewInterrogator(params interrogatorParams, lc fx.Lifecycle) (*Interrogator,
 	return i, nil
 }
 
-func (i *Interrogator) Subscribe() error {
+func (i *Identifier) Setup() error {
 	ctx, cancel := context.WithCancel(context.Background())
 	_, events := i.Crawler.AddListener(ctx)
 
 	iCtx, iCancel := context.WithCancel(context.Background())
 
-	i.CrawlCancel = cancel
-	i.CrawlEvents = events
+	i.crawlCancel = cancel
+	i.crawlEvents = events
 
-	i.ICtx = iCtx
-	i.ICancel = iCancel
+	i.iCtx = iCtx
+	i.iCancel = iCancel
 
 	return nil
 }
 
-func (i *Interrogator) start() error {
+func (i *Identifier) start() error {
 	go i.listener()
 	go i.informant()
 	return nil
 }
 
-func (i *Interrogator) stop() error {
+func (i *Identifier) stop() error {
 	fmt.Printf("Stopping interrogator...\n")
 
-	i.ICancel()
-	i.CrawlCancel()
+	i.iCancel()
+	i.crawlCancel()
 
 	// Wait briefly to give the crawler a chance to shut down
 	// 5 seconds is the empirically-derived correct amount of time to wait:
@@ -99,13 +97,13 @@ func (i *Interrogator) stop() error {
 }
 
 // Collects new peers from the crawler
-func (i *Interrogator) listener() {
+func (i *Identifier) listener() {
 
 	seenID := map[peer.ID]struct{}{}
 
-	for event := range i.CrawlEvents {
+	for event := range i.crawlEvents {
 		// Check if we've been told to stop
-		if i.ICtx.Err() != nil {
+		if i.iCtx.Err() != nil {
 			return
 		}
 
@@ -137,13 +135,13 @@ func (i *Interrogator) listener() {
 }
 
 // Aggregates protocols supported by peers we've collected from the crawler
-func (i *Interrogator) informant() {
+func (i *Identifier) informant() {
 	// We'll query our peerstore every 30 seconds
 	duration := time.Duration(30) * time.Second
 
 	for {
 		// Check if we've been told to stop
-		if i.ICtx.Err() != nil {
+		if i.iCtx.Err() != nil {
 			return
 		}
 
@@ -161,7 +159,7 @@ type iResults struct {
 	seenProtos    map[string]uint // map[protocol] -> # peers supporting
 }
 
-func (i *Interrogator) queryProtocols() *iResults {
+func (i *Identifier) queryProtocols() *iResults {
 
 	results := &iResults{
 		mostSupported: -1,
@@ -227,11 +225,11 @@ type protoPair struct {
 
 type pairList []protoPair
 
-func (i *Interrogator) printUpdate(res *iResults) {
+func (i *Identifier) printUpdate(res *iResults) {
 
 	outputArr := make([]string, 0)
 
-	outputArr = append(outputArr, fmt.Sprintf("--- Interrogation results: ---\n"))
+	outputArr = append(outputArr, fmt.Sprintf("--- Identifier results: ---\n"))
 	outputArr = append(outputArr, fmt.Sprintf(">> %d peers queried:\n", len(i.supports)))
 	outputArr = append(outputArr, fmt.Sprintf("- %d unique protocols supported\n", len(res.seenProtos)))
 	outputArr = append(outputArr, fmt.Sprintf("- Peer %s supports the most, at %d\n", res.mostProtocols, res.mostSupported))

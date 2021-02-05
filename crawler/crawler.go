@@ -30,19 +30,20 @@ type Crawler struct {
 	ID  *identify.IDService
 	PS  peerstore.Peerstore
 
-	// We receive QueryEvents from the DHT on this channel
-	Events    <-chan *routing.QueryEvent
-	DHTCtx    context.Context
-	DHTCancel context.CancelFunc
+	*Report // Aggregates crawl data
 
-	WorkerCtx    context.Context
-	WorkerCancel context.CancelFunc
+	// We receive QueryEvents from the DHT on this channel
+	events    <-chan *routing.QueryEvent
+	dhtCtx    context.Context
+	dhtCancel context.CancelFunc
+
+	workerCtx    context.Context
+	workerCancel context.CancelFunc
 
 	// Used by modules to receive Events from the crawl
-	Listeners []context.Context
+	listeners []context.Context
 
-	*Report
-	NumWorkers uint
+	numWorkers uint
 }
 
 type crawlerParams struct {
@@ -53,22 +54,22 @@ type crawlerParams struct {
 func NewCrawler(params crawlerParams, lc fx.Lifecycle) (*Crawler, error) {
 
 	// Create a context that, when passed to DHT queries, emits QueryEvents to a channel
-	DHTCtx, DHTCancel := context.WithCancel(context.Background())
-	DHTCtx, events := routing.RegisterForQueryEvents(DHTCtx)
+	dhtCtx, dhtCancel := context.WithCancel(context.Background())
+	dhtCtx, events := routing.RegisterForQueryEvents(dhtCtx)
 
 	// Create context/cancel for our workers
-	WorkerCtx, WorkerCancel := context.WithCancel(context.Background())
+	workerCtx, workerCancel := context.WithCancel(context.Background())
 
 	crawler := &Crawler{
 		Report: &Report{
 			Peers: make(map[peer.ID]*Peer),
 		},
-		DHTCtx:       DHTCtx,
-		DHTCancel:    DHTCancel,
-		Events:       events,
-		WorkerCtx:    WorkerCtx,
-		WorkerCancel: WorkerCancel,
-		Listeners:    make([]context.Context, 0),
+		dhtCtx:       dhtCtx,
+		dhtCancel:    dhtCancel,
+		events:       events,
+		workerCtx:    workerCtx,
+		workerCancel: workerCancel,
+		listeners:    make([]context.Context, 0),
 	}
 
 	lc.Append(fx.Hook{
@@ -91,7 +92,7 @@ func (c *Crawler) SetNumWorkers(numWorkers uint) error {
 	if numWorkers == 0 {
 		return fmt.Errorf("Cannot query DHT without workers")
 	}
-	c.NumWorkers = numWorkers
+	c.numWorkers = numWorkers
 	return nil
 }
 
@@ -99,14 +100,14 @@ func (c *Crawler) SetNumWorkers(numWorkers uint) error {
 // The returned channel will emit events from the crawl
 func (c *Crawler) AddListener(ctx context.Context) (context.Context, <-chan *Event) {
 	ctx, events := RegisterForEvents(ctx)
-	c.Listeners = append(c.Listeners, ctx)
+	c.listeners = append(c.listeners, ctx)
 	return ctx, events
 }
 
 // Build the crawler: start libp2p node and open a DB for our DHT
 func (c *Crawler) build() error {
 
-	if c.NumWorkers == 0 {
+	if c.numWorkers == 0 {
 		return fmt.Errorf("Expected nonzero number of workers")
 	}
 
@@ -150,11 +151,11 @@ func (c *Crawler) build() error {
 // - workers to query the DHT
 // - an aggregator to collect results from worker queries
 func (c *Crawler) start() error {
-	if c.NumWorkers == 0 {
+	if c.numWorkers == 0 {
 		return fmt.Errorf("Expected nonzero NumWorkers")
 	}
 
-	for i := 0; i < int(c.NumWorkers); i++ {
+	for i := 0; i < int(c.numWorkers); i++ {
 		go c.spawnWorker()
 	}
 
@@ -165,8 +166,8 @@ func (c *Crawler) start() error {
 func (c *Crawler) stop() error {
 	fmt.Printf("Stopping crawler...\n")
 
-	c.DHTCancel()
-	c.WorkerCancel()
+	c.dhtCancel()
+	c.workerCancel()
 
 	// Wait briefly to give the crawler a chance to shut down
 	// 5 seconds is the empirically-derived correct amount of time to wait:
@@ -180,7 +181,7 @@ func (c *Crawler) stop() error {
 func (c *Crawler) spawnWorker() {
 Work:
 	// Check if we've been told to stop
-	if c.WorkerCtx.Err() != nil {
+	if c.workerCtx.Err() != nil {
 		return
 	}
 	id, err := randPeerID()
@@ -189,7 +190,7 @@ Work:
 		goto Work
 	}
 
-	ctx, cancel := context.WithTimeout(c.DHTCtx, 10*time.Second)
+	ctx, cancel := context.WithTimeout(c.dhtCtx, 10*time.Second)
 	_, _ = c.DHT.FindPeer(ctx, id)
 	cancel()
 	goto Work
@@ -200,10 +201,10 @@ func (c *Crawler) aggregator() {
 	// Get our PeerID, so we can filter responses that come from our own node
 	self := c.DHT.PeerID()
 
-	for report := range c.Events {
+	for report := range c.events {
 
 		// Check if we've been told to stop
-		if c.WorkerCtx.Err() != nil {
+		if c.workerCtx.Err() != nil {
 			return
 		}
 
@@ -349,7 +350,7 @@ func (c *Crawler) aggregator() {
 
 // Iterates over registered listeners and publishes an event to each
 func (c *Crawler) publish(event *Event) {
-	for _, listener := range c.Listeners {
+	for _, listener := range c.listeners {
 		PublishEvent(listener, event)
 	}
 }
