@@ -34,6 +34,7 @@ const (
 	FlagReportInterval        = "report-interval"
 	FlagReportPublishEndpoint = "report-endpoint"
 	FlagReportPingEndpoint    = "report-ping"
+	FlagReportAPIKey          = "report-api-key"
 )
 
 // Default returns a Config that sets up the crawler
@@ -92,6 +93,7 @@ func (c *Config) ConfigReporter(cctx *cli.Context) {
 				cctx.Uint(FlagReportInterval),
 				cctx.String(FlagReportPublishEndpoint),
 				cctx.String(FlagReportPingEndpoint),
+				cctx.String(FlagReportAPIKey),
 			)
 		}))
 		c.hello = append(c.hello,
@@ -99,6 +101,7 @@ func (c *Config) ConfigReporter(cctx *cli.Context) {
 			fmt.Sprintf("- report interval: %d min\n", cctx.Uint(FlagReportInterval)),
 			fmt.Sprintf("- report publish endpoint: %s\n", cctx.String(FlagReportPublishEndpoint)),
 			fmt.Sprintf("- report ping endpoint: %s\n", cctx.String(FlagReportPingEndpoint)),
+			fmt.Sprintf("- report api key: %s\n", cctx.String(FlagReportAPIKey)),
 		)
 	}
 }

@@ -68,14 +68,19 @@ func main() {
 			&cli.StringFlag{
 				Name:    config.FlagReportPublishEndpoint,
 				Aliases: []string{"re"},
-				Value:   "http://127.0.0.1:8000/crawl",
+				Value:   "http://127.0.0.1:8000/batch",
 				Usage:   "the url/endpoint the reporter will publish crawl results to",
 			},
 			&cli.StringFlag{
 				Name:    config.FlagReportPingEndpoint,
 				Aliases: []string{"rp"},
-				Value:   "http://127.0.0.1:8000/ping",
+				Value:   "http://127.0.0.1:8000/healthcheck",
 				Usage:   "the url/endpoint the reporter will ping on startup to ensure the server is running",
+			},
+			&cli.StringFlag{
+				Name:    config.FlagReportAPIKey,
+				Aliases: []string{"ra"},
+				Usage:   "the API key used to authenticate the reporter's reports",
 			},
 		},
 		Action: func(cctx *cli.Context) error {

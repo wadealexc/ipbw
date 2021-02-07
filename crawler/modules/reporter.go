@@ -29,6 +29,7 @@ type Reporter struct {
 	interval        time.Duration
 	publishEndpoint string
 	pingEndpoint    string
+	apiKey          string
 
 	setupDone bool // Used to check that we did setup
 }
@@ -82,7 +83,7 @@ func NewReporter(params reporterParams, lc fx.Lifecycle) (*Reporter, error) {
 	return reporter, nil
 }
 
-func (r *Reporter) Setup(interval uint, publishEndpoint string, pingEndpoint string) error {
+func (r *Reporter) Setup(interval uint, publishEndpoint string, pingEndpoint string, apiKey string) error {
 	if r.setupDone {
 		return fmt.Errorf("Reporter completed setup twice")
 	} else if interval == 0 {
@@ -91,11 +92,14 @@ func (r *Reporter) Setup(interval uint, publishEndpoint string, pingEndpoint str
 		return fmt.Errorf("Expected nonempty publishEndpoint")
 	} else if pingEndpoint == "" {
 		return fmt.Errorf("Expected nonempty pingEndpoint")
+	} else if apiKey == "" {
+		return fmt.Errorf("Expected nonempty API key")
 	}
 
 	r.interval = time.Duration(interval) * time.Minute
 	r.publishEndpoint = publishEndpoint
 	r.pingEndpoint = pingEndpoint
+	r.apiKey = apiKey
 
 	// Register a new listener with the crawler
 	// The crawler will send us CrawlResults on the returned channel
@@ -204,20 +208,31 @@ func (r *Reporter) reporter() {
 			reportBody, err := json.Marshal(r.report.ReportJSON)
 			if err != nil {
 				fmt.Printf("Error marshalling ReportJSON: %v\n", err)
-				return
+				continue
 			}
 			r.report.mu.Unlock()
 
-			resp, err := http.Post(r.publishEndpoint, "application/json", bytes.NewBuffer(reportBody))
+			client := &http.Client{}
+
+			req, err := http.NewRequest("POST", r.publishEndpoint, bytes.NewBuffer(reportBody))
 			if err != nil {
-				fmt.Printf("Error publishing report to server: %v\n", err)
-				return
+				fmt.Printf("Error creating POST request: %v\n", err)
+				continue
+			}
+
+			req.Header.Add("User-Agent", fmt.Sprintf("ipbw-go-%s", crawler.Version))
+			req.Header.Add("Authorization", r.apiKey)
+
+			resp, err := client.Do(req)
+			if err != nil {
+				fmt.Printf("Error publishing to server: %v\n", err)
+				continue
 			}
 
 			body, err := ioutil.ReadAll(resp.Body)
 			if err != nil {
 				fmt.Printf("Error reading server response: %v\n", err)
-				return
+				continue
 			}
 
 			fmt.Printf("Published report to server. Got response: %s\n", string(body))
@@ -227,7 +242,17 @@ func (r *Reporter) reporter() {
 }
 
 func (r *Reporter) pingServer() (string, error) {
-	resp, err := http.Get(r.pingEndpoint)
+	client := &http.Client{}
+
+	req, err := http.NewRequest("GET", r.pingEndpoint, bytes.NewBuffer(nil))
+	if err != nil {
+		return "", fmt.Errorf("Error constructing GET request: %v", err)
+	}
+
+	req.Header.Add("User-Agent", fmt.Sprintf("ipbw-go-%s", crawler.Version))
+	req.Header.Add("Authorization", r.apiKey)
+
+	resp, err := client.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("Got error pinging server: %v", err)
 	}

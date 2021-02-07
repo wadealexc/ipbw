@@ -22,6 +22,9 @@ import (
 	"go.uber.org/fx"
 )
 
+// Version of the crawler instance
+const Version = "0.1"
+
 // Crawler contains all the infrastructure needed to crawl the IPFS DHT
 type Crawler struct {
 	host.Host
@@ -409,7 +412,7 @@ func (c *Crawler) filterSelf(self peer.ID, report *routing.QueryEvent) []*peer.A
 
 // Iterates over a collection of multiaddrs and attempts to find ip+port combos
 func (c *Crawler) filterIPs(addrs []ma.Multiaddr) []string {
-	var results []string = make([]string, 0)
+	results := make([]string, 0)
 	for _, addr := range addrs {
 		fields := strings.Split(addr.String(), "/")
 
