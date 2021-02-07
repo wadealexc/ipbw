@@ -79,7 +79,7 @@ func main() {
 			},
 			&cli.StringFlag{
 				Name:    config.FlagReportAPIKey,
-				Aliases: []string{"ra"},
+				Aliases: []string{"a"},
 				Usage:   "the API key used to authenticate the reporter's reports",
 			},
 		},

@@ -26,8 +26,9 @@ GLOBAL OPTIONS:
    --enable-identifier, -i              enables the identifier module (default: false)
    --enable-reporter, -r                enables the reporter module, which publishes results to a server (default: false)
    --report-interval value, --ri value  how often (in minutes) the reporter will publish crawl results to the server (default: 1)
-   --report-endpoint value, --re value  the url/endpoint the reporter will publish crawl results to (default: "http://127.0.0.1:8000/crawl")
-   --report-ping value, --rp value      the url/endpoint the reporter will ping on startup to ensure the server is running (default: "http://127.0.0.1:8000/ping")
+   --report-endpoint value, --re value  the url/endpoint the reporter will publish crawl results to (default: "http://127.0.0.1:8000/batch")
+   --report-ping value, --rp value      the url/endpoint the reporter will ping on startup to ensure the server is running (default: "http://127.0.0.1:8000/healthcheck")
+   --report-api-key value, -a value   the API key used to authenticate the reporter's reports
    --help, -h                           show help (default: false)
 ```
 
