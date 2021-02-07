@@ -2,81 +2,133 @@ package main
 
 import (
 	"context"
-	"flag"
 	"fmt"
 	"os"
 	"os/signal"
 	"time"
 
-	"github.com/wadeAlexC/ipbw/crawler"
+	"github.com/wadeAlexC/ipbw/config"
+
+	"github.com/urfave/cli/v2"
+
+	"go.uber.org/fx"
 )
-
-var (
-	crawlDuration   = flag.Uint("d", 5, "(Optional) Number of minutes to crawl. 5 mins by default.")
-	apiKey          = flag.String("a", "", "(REQUIRED) The API key for server authentication")
-	noPublish       = flag.Bool("n", false, "(Optional) If set, will not publish results to the server.")
-	publishInterval = flag.Uint("p", 1, "(Optional) Number of minutes between reports published to server. 1 min by default.")
-	reportInterval  = flag.Uint("r", 1, "(Optional) Number of minutes between reports printed to console. 1 min by default.")
-	numWorkers      = flag.Uint("w", 8, "(Optional) Number of goroutines to query DHT with. Default is 8.")
-)
-
-// Where to publish reports to
-const server = "http://127.0.0.1:8000/batch"
-
-// Used to check if the server is running
-const serverPing = "http://127.0.0.1:8000/healthcheck"
 
 func main() {
 
-	// Silence that one annoying errorw from basichost.
-	// lvl, err := logging.LevelFromString("DPANIC")
-	// if err != nil {
-	// 	panic(err)
-	// }
-	// logging.SetAllLoggers(lvl)
+	app := &cli.App{
+		Name:                   "Interplanetary Black Widow",
+		HelpName:               "ipbw",
+		Usage:                  "crawls ur IPFS nodes",
+		EnableBashCompletion:   true,
+		UseShortOptionHandling: true, // combine -o + -v -> -ov
+		Flags: []cli.Flag{
+			&cli.UintFlag{
+				Name:    config.FlagCrawlDuration,
+				Aliases: []string{"d"},
+				Value:   5,
+				Usage:   "specify the number of minutes the crawler should run for",
+			},
+			&cli.UintFlag{
+				Name:    config.FlagNumWorkers,
+				Aliases: []string{"n"},
+				Value:   8,
+				Usage:   "specify the number of goroutines used to query the DHT",
+			},
+			&cli.BoolFlag{
+				Name:    config.FlagEnableStatus,
+				Aliases: []string{"s"},
+				Value:   true,
+				Usage:   "specify whether the crawler should output occasional status updates to console.",
+			},
+			&cli.UintFlag{
+				Name:    config.FlagStatusInterval,
+				Aliases: []string{"si"},
+				Value:   1,
+				Usage:   "how often (in minutes) status updates will be posted",
+			},
+			&cli.BoolFlag{
+				Name:    config.FlagEnableIdentifier,
+				Aliases: []string{"i"},
+				Value:   false,
+				Usage:   "enables the identifier module",
+			},
+			&cli.BoolFlag{
+				Name:    config.FlagEnableReporter,
+				Aliases: []string{"r"},
+				Value:   false,
+				Usage:   "enables the reporter module, which publishes results to a server",
+			},
+			&cli.UintFlag{
+				Name:    config.FlagReportInterval,
+				Aliases: []string{"ri"},
+				Value:   1,
+				Usage:   "how often (in minutes) the reporter will publish crawl results to the server",
+			},
+			&cli.StringFlag{
+				Name:    config.FlagReportPublishEndpoint,
+				Aliases: []string{"re"},
+				Value:   "http://127.0.0.1:8000/batch",
+				Usage:   "the url/endpoint the reporter will publish crawl results to",
+			},
+			&cli.StringFlag{
+				Name:    config.FlagReportPingEndpoint,
+				Aliases: []string{"rp"},
+				Value:   "http://127.0.0.1:8000/healthcheck",
+				Usage:   "the url/endpoint the reporter will ping on startup to ensure the server is running",
+			},
+			&cli.StringFlag{
+				Name:    config.FlagReportAPIKey,
+				Aliases: []string{"ra"},
+				Usage:   "the API key used to authenticate the reporter's reports",
+			},
+		},
+		Action: func(cctx *cli.Context) error {
 
-	// Parse CLI flags and make sure they make sense
-	flag.Parse()
+			// Get default crawler config from cli flags:
+			cfg := config.Default(cctx)
 
-	options := &crawler.Options{
-		NoPublish:       *noPublish,
-		PublishInterval: *publishInterval,
-		ReportInterval:  *reportInterval,
-		NumWorkers:      *numWorkers,
-		Server:          server,
-		ServerPing:      serverPing,
-		APIKey:          *apiKey,
+			// Get config for optional modules, if enabled:
+			cfg.ConfigStatus(cctx)     // modules/status
+			cfg.ConfigIdentifier(cctx) // modules/identifier
+			cfg.ConfigReporter(cctx)   // modules/reporter
+
+			// Print information about the crawl we're about to do
+			cfg.PrintHello()
+
+			app := fx.New(
+				fx.Options(cfg.Modules...),
+				fx.Options(cfg.Invokes...),
+				fx.NopLogger, // Disable fx logging. Start/Stop will short-circuit if there are errors
+			)
+
+			// Get crawl duration:
+			duration := time.Duration(cctx.Uint(config.FlagCrawlDuration)) * time.Minute
+
+			if err := app.Start(context.Background()); err != nil {
+				return fmt.Errorf("Error starting app: %v", err)
+			}
+
+			// Create a channel that will be notified of os.Interrupt or os.Kill signals
+			ch := make(chan os.Signal, 1)
+			signal.Notify(ch, os.Interrupt, os.Kill)
+
+			select {
+			case <-time.After(duration):
+				if err := app.Stop(context.Background()); err != nil {
+					panic(fmt.Errorf("Error on shutdown: %v", err))
+				}
+			case <-ch:
+				if err := app.Stop(context.Background()); err != nil {
+					panic(fmt.Errorf("Error on shutdown: %v", err))
+				}
+			}
+
+			return nil
+		},
 	}
 
-	fmt.Printf("IPBW: Starting %d minute crawl with %d workers\n", *crawlDuration, *numWorkers)
-	if !*noPublish {
-		fmt.Printf("Publishing results to (%s) every %d minutes\n", server, *publishInterval)
-	}
-
-	ctx := context.Background()
-	crawler, err := crawler.NewCrawler(ctx, options)
-	if err != nil {
-		fmt.Printf("Error creating crawler: %v\nStopping...\n", err)
-		return
-	}
-	crawler.Start()
-
-	// Create a channel that will be notified of os.Interrupt or os.Kill signals
-	// This way, if we stop the crawler (e.g. with ^C), we can exit gracefully.
-	ch := make(chan os.Signal, 1)
-	signal.Notify(ch, os.Interrupt, os.Kill)
-
-	// Calculate total runtime
-	totalDuration := time.Duration(*crawlDuration) * 60 * time.Second
-
-	select {
-	case <-time.After(totalDuration):
-		crawler.Stop()
-		return
-	case <-ch:
-		crawler.Kill()
-		return
-	case <-ctx.Done():
-		return
+	if err := app.Run(os.Args); err != nil {
+		panic(err) // burn it all to the ground
 	}
 }

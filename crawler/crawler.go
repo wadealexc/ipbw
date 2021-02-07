@@ -1,279 +1,278 @@
 package crawler
 
 import (
-	"bytes"
 	"context"
 	"crypto/rand"
-	"encoding/json"
 	"fmt"
-	"io/ioutil"
 	"net"
-	"net/http"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/ipfs/go-datastore"
 	badger "github.com/ipfs/go-ds-badger"
 	"github.com/libp2p/go-libp2p"
+	"github.com/libp2p/go-libp2p-core/host"
 	"github.com/libp2p/go-libp2p-core/peer"
+	"github.com/libp2p/go-libp2p-core/peerstore"
 	"github.com/libp2p/go-libp2p-core/routing"
-	host "github.com/libp2p/go-libp2p-host"
 	dht "github.com/libp2p/go-libp2p-kad-dht"
 	"github.com/libp2p/go-libp2p/p2p/protocol/identify"
 	ma "github.com/multiformats/go-multiaddr"
 	mh "github.com/multiformats/go-multihash"
+	"go.uber.org/fx"
 )
 
 // Version of the crawler instance
 const Version = "0.1"
 
-// Crawler holds info about an active crawl
+// Crawler contains all the infrastructure needed to crawl the IPFS DHT
 type Crawler struct {
-	// IPFS / libp2p fields
-	host host.Host
-	dht  *dht.IpfsDHT
-	ds   datastore.Batching
-	id   *identify.IDService
+	host.Host
+	DHT *dht.IpfsDHT
+	DS  datastore.Batching
+	ID  *identify.IDService
+	PS  peerstore.Peerstore
+
+	peers map[peer.ID]*Peer
 
 	// We receive QueryEvents from the DHT on this channel
-	events <-chan *routing.QueryEvent
-	report *Report // Result aggregator
+	events    <-chan *routing.QueryEvent
+	dhtCtx    context.Context
+	dhtCancel context.CancelFunc
 
-	// Context and cancel function passed to DHT queries
-	ctx    context.Context
-	cancel context.CancelFunc
-	wg     sync.WaitGroup
+	workerCtx    context.Context
+	workerCancel context.CancelFunc
 
-	opts *Options
+	// Maps a crawler EventType to a list of listeners
+	listenersByType map[EventType][]context.Context
+
+	numWorkers uint
+
+	setupDone bool // Used to check that we did setup
 }
 
-// Report aggregates results from QueryEvents
-type Report struct {
-	mu    sync.RWMutex
-	peers map[peer.ID]*Peer
+type crawlSubscriber struct {
+	ctx   context.Context
+	types map[EventType]bool
 }
 
-// Peer contains all the info we know for a given peer
-type Peer struct {
-	isReporter bool      // Whether this peer reported other peers to us
-	ips        []string  // All known IPs/ports for this peer
-	neighbors  []peer.ID // All neighbors this peer reported to us
-	timestamp  string    // The UTC timestamp when we discovered the peer
+type crawlerParams struct {
+	fx.In
 }
 
-// Options are various configurations for the crawler
-type Options struct {
-	NoPublish       bool   // Whether we're publishing reports to a server
-	PublishInterval uint   // How often a report is sent to our server
-	ReportInterval  uint   // How often a report will be printed to the console
-	NumWorkers      uint   // Number of goroutines to query the DHT with
-	Server          string // Endpoint to publish results to
-	ServerPing      string // Endpoint to check if server is running
-	APIKey          string // API key to authenticate with to the report server
-}
-
-// NewCrawler starts our libp2p node and bootstraps connections
-func NewCrawler(ctx context.Context, opts *Options) (*Crawler, error) {
+// NewCrawler instantiates our libp2p node and dht database
+func NewCrawler(params crawlerParams, lc fx.Lifecycle) (*Crawler, error) {
 
 	// Create a context that, when passed to DHT queries, emits QueryEvents to a channel
-	ctx, cancel := context.WithCancel(ctx)
-	ctx, events := routing.RegisterForQueryEvents(ctx)
+	dhtCtx, dhtCancel := context.WithCancel(context.Background())
+	dhtCtx, events := routing.RegisterForQueryEvents(dhtCtx)
+
+	// Create context/cancel for our workers
+	workerCtx, workerCancel := context.WithCancel(context.Background())
+
+	crawler := &Crawler{
+		peers:           make(map[peer.ID]*Peer),
+		dhtCtx:          dhtCtx,
+		dhtCancel:       dhtCancel,
+		events:          events,
+		workerCtx:       workerCtx,
+		workerCancel:    workerCancel,
+		listenersByType: make(map[EventType][]context.Context),
+	}
+
+	lc.Append(fx.Hook{
+		OnStart: func(context.Context) error {
+			if err := crawler.build(); err != nil {
+				return fmt.Errorf("Error building crawler: %v", err)
+			}
+			return crawler.start()
+		},
+		OnStop: func(context.Context) error {
+			return crawler.stop()
+		},
+	})
+
+	return crawler, nil
+}
+
+func (c *Crawler) Setup(numWorkers uint) error {
+	if c.setupDone {
+		return fmt.Errorf("Crawler completed setup twice")
+	} else if numWorkers == 0 {
+		return fmt.Errorf("Expected nonzero number of workers")
+	}
+
+	c.numWorkers = numWorkers
+	c.setupDone = true
+	return nil
+}
+
+func (c *Crawler) NewListener(eType EventType) (context.CancelFunc, <-chan Event) {
+	ctx, cancel := context.WithCancel(context.Background())
+	ctx, events := RegisterForEvents(ctx)
+
+	// Crawler remembers the context, which will be used to send the events
+	c.listenersByType[eType] = append(c.listenersByType[eType], ctx)
+
+	// We return the CancelFunc and channel, as those are used to listen / cancel
+	return cancel, events
+}
+
+// Build the crawler: start libp2p node and open a DB for our DHT
+func (c *Crawler) build() error {
+
+	if c.numWorkers == 0 {
+		return fmt.Errorf("Expected nonzero number of workers")
+	}
 
 	// Start a libp2p node
 	host, err := libp2p.New(context.Background())
 	if err != nil {
-		return nil, err
+		return fmt.Errorf("Error creating libp2p node: %v", err)
 	}
+	c.Host = host
 
 	// Create a DB for our DHT client
 	ds, err := badger.NewDatastore("dht.db", nil)
 	if err != nil {
-		return nil, err
+		return fmt.Errorf("Error getting datastore: %v", err)
 	}
+	c.DS = ds
 
-	crawler := &Crawler{
-		ctx:    ctx,
-		cancel: cancel,
-		events: events,
-		host:   host,
-		dht:    dht.NewDHTClient(ctx, host, ds),
-		ds:     ds,
-		id:     identify.NewIDService(host),
-		report: &Report{
-			peers: make(map[peer.ID]*Peer),
-		},
-		opts: opts,
-	}
+	c.DHT = dht.NewDHTClient(context.Background(), host, ds)
+	c.ID = identify.NewIDService(host)
+	c.PS = host.Peerstore()
 
-	// Bootstrap
+	// Bootstrap peers
 	for _, a := range dht.DefaultBootstrapPeers {
 		pInfo, err := peer.AddrInfoFromP2pAddr(a)
 		if err != nil {
-			return nil, err
+			return fmt.Errorf("Error converting bootstrap address: %v", err)
 		}
 
-		ctx, cancel = context.WithTimeout(crawler.ctx, 5*time.Second)
-		if err = crawler.host.Connect(ctx, *pInfo); err != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		if err = c.Host.Connect(ctx, *pInfo); err != nil {
 			fmt.Printf("skipping bootstrap peer: %s\n", pInfo.ID.Pretty())
 		}
 
 		cancel()
 	}
 
-	// Make sure server is running
-	if !crawler.opts.NoPublish {
-		response, err := crawler.pingServer()
-		if err != nil {
-			return nil, err
-		}
-
-		fmt.Printf("Server says: %s\n", response)
-	}
-
-	return crawler, nil
+	return nil
 }
 
-// Start spawns all the goroutines we need for world domination
-func (c *Crawler) Start() {
-	for i := 0; i < int(c.opts.NumWorkers); i++ {
-		c.wg.Add(1)
-		go c.worker() // Queries DHT
+// Start crawler's long-running processes:
+// - workers to query the DHT
+// - an aggregator to collect results from worker queries
+func (c *Crawler) start() error {
+	if !c.setupDone {
+		return fmt.Errorf("Expected crawler to be set up before start")
 	}
 
-	go c.aggregator() // Collects results from c.events
-	go c.logger()     // Prints intermittent status updates to console
-	if !c.opts.NoPublish {
-		go c.reporter() // Publishes results to server
+	for i := 0; i < int(c.numWorkers); i++ {
+		go c.spawnWorker()
 	}
+
+	go c.aggregator()
+	return nil
 }
 
-// Stop stops the crawl, but waits briefly to allow tasks to finish
-func (c *Crawler) Stop() {
-	// 5 seconds is the empirically-derived correct time to wait
-	waitTime := time.Duration(5) * time.Second
+func (c *Crawler) stop() error {
+	c.dhtCancel()
+	c.workerCancel()
 
+	// Wait briefly to give the crawler a chance to shut down
+	// 5 seconds is the empirically-derived correct amount of time to wait:
+	waitFor := time.Duration(5) * time.Second
 	select {
-	case <-time.After(waitTime):
-		c.Kill()
+	case <-time.After(waitFor):
+		return nil
+	}
+}
+
+func (c *Crawler) spawnWorker() {
+Work:
+	// Check if we've been told to stop
+	if c.workerCtx.Err() != nil {
 		return
 	}
-}
-
-// Kill stops the crawl ASAP
-func (c *Crawler) Kill() {
-	if err := c.ds.Close(); err != nil {
-		fmt.Printf("error while shutting down: %v\n", err)
-	}
-
-	c.cancel()
-	c.wg.Done()
-}
-
-// Each worker generates a random peer ID, then queries the DHT
-// Results are received via the c.events channel
-func (c *Crawler) worker() {
-Work:
 	id, err := randPeerID()
 	if err != nil {
 		fmt.Printf("Error getting random peer ID: %v\n", err)
 		goto Work
 	}
 
-	ctx, cancel := context.WithTimeout(c.ctx, 10*time.Second)
-	_, _ = c.dht.FindPeer(ctx, id)
+	ctx, cancel := context.WithTimeout(c.dhtCtx, 10*time.Second)
+	_, _ = c.DHT.FindPeer(ctx, id)
 	cancel()
 	goto Work
 }
 
-// Publishes reports to a server
-func (c *Crawler) reporter() {
-	publishInterval := time.Duration(c.opts.PublishInterval) * time.Minute
-	for {
-		select {
-		case <-time.After(publishInterval):
-			if c.opts.NoPublish {
-				continue
-			}
-
-			// Send report to server
-			response, err := c.publishResults()
-			if err != nil {
-				fmt.Printf("Error publishing result: %v\n", err)
-			} else {
-				fmt.Printf("Sent report to (%s) and got response: %s\n", c.opts.Server, response)
-			}
-		case <-c.ctx.Done():
-			return
-		}
-	}
-}
-
-// Prints incremental status updates to console
-func (c *Crawler) logger() {
-	startTime := time.Now()
-	reportInterval := time.Duration(c.opts.ReportInterval) * time.Minute
-	for {
-		select {
-		case <-time.After(reportInterval):
-			timeElapsed := uint(time.Now().Sub(startTime).Minutes())
-
-			// Tally results and print
-			results := c.getResults()
-
-			// VERY important to get this right or the whole world will burn
-			if timeElapsed == 1 {
-				fmt.Printf("--- Time elapsed: %d minute ---\n", timeElapsed)
-			} else {
-				fmt.Printf("--- Time elapsed: %d minutes ---\n", timeElapsed)
-			}
-
-			fmt.Printf(">> %d peers reporting:\n", results.numReporters)
-			fmt.Printf("- %d unique peer IDs -\n", results.uniquePeers)
-			fmt.Printf("- %d peers with a valid IP+port -\n", results.peersWithIPs)
-			fmt.Printf("- %d unique IP+port combinations -\n", results.uniqueTargets)
-		case <-c.ctx.Done():
-			return
-		}
-	}
-}
-
-// Receives and filters QueryEvents from the DHT
+// Collects results from DHT QueryEvents
 func (c *Crawler) aggregator() {
 	// Get our PeerID, so we can filter responses that come from our own node
-	self := c.dht.PeerID()
+	self := c.DHT.PeerID()
 
-	for report := range c.events {
-		// We only care about PeerResponse events, as these
-		// are peers informing us of peers they know.
-		if report.Type != routing.PeerResponse {
+	for event := range c.events {
+
+		// Check if we've been told to stop
+		if c.workerCtx.Err() != nil {
+			return
+		}
+
+		if event.Type == routing.QueryError {
+			c.publishQueryError(event.Extra)
+			continue
+		} else if event.Type != routing.PeerResponse {
 			continue
 		}
 
 		// Get reporting peer, the IDs/Addrs they reported, and a timestamp
-		reporter := report.ID
-		response := filterSelf(self, report)
+		reporter := event.ID
+		response := c.filterSelf(self, event)
 		timestamp := time.Now().UTC().String()
+		// Remember newly-discovered peers
+		newPeers := make([]peer.ID, 0)
 
 		// No responses? Skip!
 		if len(response) == 0 {
 			continue
 		}
 
-		c.report.mu.RLock() // Lock for reads
-
-		// Check if this reporter exists in our report yet. If not, create an entry:
-		if _, exists := c.report.peers[reporter]; !exists {
-			c.report.peers[reporter] = &Peer{
-				isReporter: true,
-				ips:        make([]string, 0), // TODO we can probably query our PeerStore here
-				neighbors:  make([]peer.ID, 0),
-				timestamp:  timestamp,
+		// Check if we've seen this reporter yet. If not, create an entry:
+		if _, exists := c.peers[reporter]; !exists {
+			c.peers[reporter] = &Peer{
+				ID:         reporter,
+				IsReporter: true,
+				Ips:        make([]string, 0),
+				Neighbors:  make([]peer.ID, 0),
+				Timestamp:  timestamp,
 			}
-		} else if !c.report.peers[reporter].isReporter {
+			newPeers = append(newPeers, reporter)
+		} else if !c.peers[reporter].IsReporter {
 			// They exist, but have not been a reporter yet
-			c.report.peers[reporter].isReporter = true
+			c.peers[reporter].IsReporter = true
 		}
+
+		// Query our peerstore to see if we have additional IPs for our reporter
+		addrInfo := c.PS.PeerInfo(reporter)
+		reporterIPs := make([]string, 0)
+		seenIP := map[string]struct{}{}
+		for _, ip := range c.peers[reporter].Ips {
+			if _, seen := seenIP[ip]; !seen {
+				seenIP[ip] = struct{}{}
+				reporterIPs = append(reporterIPs, ip)
+			}
+		}
+
+		for _, ip := range c.filterIPs(addrInfo.Addrs) {
+			if _, seen := seenIP[ip]; !seen {
+				seenIP[ip] = struct{}{}
+				reporterIPs = append(reporterIPs, ip)
+			}
+		}
+
+		c.peers[reporter].Ips = reporterIPs
 
 		// We need to update our reporter's neighbors with the IDs they just gave us.
 		// First, figure out what neighbors we already know about:
@@ -282,7 +281,7 @@ func (c *Crawler) aggregator() {
 		seenID[reporter] = struct{}{} // No, you aren't your own neighbor
 
 		// Range over already-known neighbors
-		for _, neighbor := range c.report.peers[reporter].neighbors {
+		for _, neighbor := range c.peers[reporter].Neighbors {
 			// Record as neighbor and filter duplicates
 			if _, seen := seenID[neighbor]; !seen {
 				seenID[neighbor] = struct{}{}
@@ -292,8 +291,9 @@ func (c *Crawler) aggregator() {
 
 		// Next, for each newly-reported neighbor:
 		// 1. Record them as one of our reporter's neighbors
-		// 2. Add them to c.report.peers if they don't exist yet
-		// 3. Update their report entry with the new IPs we have for them
+		// 2. Add them to c.peers if they don't exist yet
+		//    - Record newly-discovered peers so we can publish to any listeners
+		// 3. Update their entry with the new IPs we have for them
 		for _, peerInfo := range response {
 			// 1. Record as neighbor and filter duplicates
 			if _, seen := seenID[peerInfo.ID]; !seen {
@@ -302,12 +302,14 @@ func (c *Crawler) aggregator() {
 			}
 
 			// 2. If we haven't seen this peer yet, create an entry for them
-			if _, exists := c.report.peers[peerInfo.ID]; !exists {
-				c.report.peers[peerInfo.ID] = &Peer{
-					ips:       make([]string, 0),
-					neighbors: []peer.ID{reporter}, // Our reporter is the first neighbor
-					timestamp: timestamp,
+			if _, exists := c.peers[peerInfo.ID]; !exists {
+				c.peers[peerInfo.ID] = &Peer{
+					ID:        peerInfo.ID,
+					Ips:       make([]string, 0),
+					Neighbors: []peer.ID{reporter}, // Our reporter is the first neighbor
+					Timestamp: timestamp,
 				}
+				newPeers = append(newPeers, peerInfo.ID)
 			}
 
 			// 3. Update report entry with the new IPs we have for them
@@ -316,7 +318,7 @@ func (c *Crawler) aggregator() {
 			knownIPs := make([]string, 0)
 
 			// Range over already-known IPs
-			for _, ip := range c.report.peers[peerInfo.ID].ips {
+			for _, ip := range c.peers[peerInfo.ID].Ips {
 				// Filter duplicates
 				if _, seen := seenIP[ip]; !seen {
 					seenIP[ip] = struct{}{}
@@ -325,7 +327,7 @@ func (c *Crawler) aggregator() {
 			}
 
 			// Range over newly-reported IPs
-			for _, ip := range filterIPs(peerInfo.Addrs) {
+			for _, ip := range c.filterIPs(peerInfo.Addrs) {
 				// Filter duplicates
 				if _, seen := seenIP[ip]; !seen {
 					seenIP[ip] = struct{}{}
@@ -335,164 +337,66 @@ func (c *Crawler) aggregator() {
 
 			// Finally, add this peer's known IPs to the report:
 			if len(knownIPs) != 0 {
-				c.report.peers[peerInfo.ID].ips = knownIPs
+				c.peers[peerInfo.ID].Ips = knownIPs
 			}
 		}
 
 		// Finally finally, record our reporter's neighbors
 		if len(neighbors) != 0 {
-			c.report.peers[reporter].neighbors = neighbors
+			c.peers[reporter].Neighbors = neighbors
 		}
 
-		// Unlock map for reads
-		c.report.mu.RUnlock()
+		// Publish crawl results to listeners:
+		c.publishCrawlResults(newPeers)
 	}
 }
 
-// PeerJSON is a json-marshallable form of Peer (with an added pid field)
-type PeerJSON struct {
-	Pid       string   `json:"pid"`
-	Ips       []string `json:"ips"`
-	Neighbors []string `json:"neighbors"`
-	Timestamp string   `json:"timestamp"`
+func (c *Crawler) publishQueryError(err string) {
+	for _, listener := range c.listenersByType[DHTQueryError] {
+		PublishEvent(listener, Event{
+			Type:  DHTQueryError,
+			Extra: err,
+		})
+	}
 }
 
-// ReportJSON is a json-marshallable form of Report
-type ReportJSON struct {
-	Peers []PeerJSON `json:"peers"`
-}
-
-// Convert current report to JSON and send to server
-func (c *Crawler) publishResults() (string, error) {
-	reportJSON := &ReportJSON{
-		Peers: make([]PeerJSON, 0),
+func (c *Crawler) publishCrawlResults(newPeers []peer.ID) {
+	// First, publish IDs of just new peers
+	for _, listener := range c.listenersByType[NewPeers] {
+		PublishEvent(listener, Event{
+			Type:   NewPeers,
+			Result: CrawlResult{NewPeers: newPeers},
+		})
 	}
 
-	c.report.mu.Lock() // Lock report for writes so we can read
-
-	for id, peer := range c.report.peers {
-		// Convert neighbor IDs to strings
-		neighborStrings := make([]string, len(peer.neighbors))
-		for _, neighbor := range peer.neighbors {
-			neighborStrings = append(neighborStrings, neighbor.Pretty())
-		}
-
-		// Convert peer to PeerJSON
-		peerJSON := PeerJSON{
-			Pid:       id.Pretty(),
-			Ips:       peer.ips,
-			Neighbors: neighborStrings,
-			Timestamp: peer.timestamp,
-		}
-
-		reportJSON.Peers = append(reportJSON.Peers, peerJSON)
-	}
-	c.report.mu.Unlock()
-
-	reportBody, err := json.Marshal(reportJSON)
-	if err != nil {
-		return "", err
+	// Save some work in case we don't have any listeners
+	if len(c.listenersByType[CrawlResults]) == 0 {
+		return
 	}
 
-	client := &http.Client{}
-
-	req, err := http.NewRequest("POST", c.opts.Server, bytes.NewBuffer(reportBody))
-	if err != nil {
-		return "", err
+	result := CrawlResult{
+		AllPeers: make([]Peer, 0),
 	}
 
-	req.Header.Add("User-Agent", fmt.Sprintf("ipbw-go-%s", Version))
-	req.Header.Add("Authorization", c.opts.APIKey)
-
-	resp, err := client.Do(req)
-
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-
-	body, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		return "", err
+	for _, peer := range c.peers {
+		result.AllPeers = append(result.AllPeers, *peer)
 	}
 
-	return string(body), nil
-}
-
-// Results holds printable metrics about our crawl
-type Results struct {
-	numReporters  uint // Number of peers that responded to our queries
-	uniquePeers   uint // Number of peers that we have an ID for
-	peersWithIPs  uint // Number of peers we have an IP address for
-	uniqueTargets uint // Number of unique IP+port combinations we have
-}
-
-// Iterates over our report and retrieves printable metrics
-func (c *Crawler) getResults() Results {
-
-	c.report.mu.Lock()
-	defer c.report.mu.Unlock()
-
-	results := &Results{
-		uniquePeers: uint(len(c.report.peers)),
+	for _, listener := range c.listenersByType[CrawlResults] {
+		PublishEvent(listener, Event{
+			Type:   CrawlResults,
+			Result: result,
+		})
 	}
-
-	// Track which IPs we've seen for unique target tally
-	seenIP := map[string]struct{}{}
-
-	for _, peer := range c.report.peers {
-		if peer.isReporter {
-			results.numReporters++
-		}
-
-		if len(peer.ips) != 0 {
-			results.peersWithIPs++
-		}
-
-		for _, ip := range peer.ips {
-			if _, seen := seenIP[ip]; !seen {
-				results.uniqueTargets++
-				seenIP[ip] = struct{}{}
-			}
-		}
-	}
-
-	return *results
-}
-
-func (c *Crawler) pingServer() (string, error) {
-	client := &http.Client{}
-
-	req, err := http.NewRequest("GET", c.opts.ServerPing, bytes.NewBuffer(nil))
-	if err != nil {
-		return "", err
-	}
-
-	req.Header.Add("User-Agent", fmt.Sprintf("ipbw-go-%s", Version))
-	req.Header.Add("Authorization", c.opts.APIKey)
-
-	resp, err := client.Do(req)
-
-	if err != nil {
-		return "", err
-	}
-
-	defer resp.Body.Close()
-
-	body, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		return "", err
-	}
-
-	return string(body), nil
 }
 
 // Filter DHT query responses that contain our own peer ID
-func filterSelf(self peer.ID, report *routing.QueryEvent) []*peer.AddrInfo {
+func (c *Crawler) filterSelf(self peer.ID, report *routing.QueryEvent) []*peer.AddrInfo {
 	var res []*peer.AddrInfo = make([]*peer.AddrInfo, 0)
 
 	// We don't want reports from our own node
 	if report.ID == self {
+		fmt.Printf("Unexpected self-report!\n")
 		return res
 	}
 
@@ -507,8 +411,8 @@ func filterSelf(self peer.ID, report *routing.QueryEvent) []*peer.AddrInfo {
 }
 
 // Iterates over a collection of multiaddrs and attempts to find ip+port combos
-func filterIPs(addrs []ma.Multiaddr) []string {
-	var results = make([]string, 0)
+func (c *Crawler) filterIPs(addrs []ma.Multiaddr) []string {
+	results := make([]string, 0)
 	for _, addr := range addrs {
 		fields := strings.Split(addr.String(), "/")
 
@@ -578,6 +482,7 @@ func filterIPs(addrs []ma.Multiaddr) []string {
 	return results
 }
 
+// Generates a random peer ID
 func randPeerID() (peer.ID, error) {
 	buf := make([]byte, 16)
 	rand.Read(buf)
