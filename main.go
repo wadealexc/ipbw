@@ -14,12 +14,6 @@ import (
 	"go.uber.org/fx"
 )
 
-// Where to publish reports to
-// const server = "http://127.0.0.1:8000/crawl"
-
-// Used to check if the server is running
-// const serverPing = "http://127.0.0.1:8000/ping"
-
 func main() {
 
 	app := &cli.App{
@@ -51,7 +45,7 @@ func main() {
 				Name:    config.FlagStatusInterval,
 				Aliases: []string{"si"},
 				Value:   1,
-				Usage:   "specify how often (in minutes) status updates will be posted",
+				Usage:   "how often (in minutes) status updates will be posted",
 			},
 			&cli.BoolFlag{
 				Name:    config.FlagEnableIdentifier,
@@ -59,18 +53,43 @@ func main() {
 				Value:   false,
 				Usage:   "enables the identifier module",
 			},
+			&cli.BoolFlag{
+				Name:    config.FlagEnableReporter,
+				Aliases: []string{"r"},
+				Value:   false,
+				Usage:   "enables the reporter module, which publishes results to a server",
+			},
+			&cli.UintFlag{
+				Name:    config.FlagReportInterval,
+				Aliases: []string{"ri"},
+				Value:   1,
+				Usage:   "how often (in minutes) the reporter will publish crawl results to the server",
+			},
+			&cli.StringFlag{
+				Name:    config.FlagReportPublishEndpoint,
+				Aliases: []string{"re"},
+				Value:   "http://127.0.0.1:8000/crawl",
+				Usage:   "the url/endpoint the reporter will publish crawl results to",
+			},
+			&cli.StringFlag{
+				Name:    config.FlagReportPingEndpoint,
+				Aliases: []string{"rp"},
+				Value:   "http://127.0.0.1:8000/ping",
+				Usage:   "the url/endpoint the reporter will ping on startup to ensure the server is running",
+			},
 		},
 		Action: func(cctx *cli.Context) error {
 
-			// Get default crawler config from cli flags
+			// Get default crawler config from cli flags:
 			cfg := config.Default(cctx)
 
-			// Get config for each module from cli flags:
+			// Get config for optional modules, if enabled:
 			cfg.ConfigStatus(cctx)     // modules/status
 			cfg.ConfigIdentifier(cctx) // modules/identifier
+			cfg.ConfigReporter(cctx)   // modules/reporter
 
 			// Print information about the crawl we're about to do
-			cfg.Hello()
+			cfg.PrintHello()
 
 			app := fx.New(
 				fx.Options(cfg.Modules...),
@@ -80,8 +99,6 @@ func main() {
 
 			// Get crawl duration:
 			duration := time.Duration(cctx.Uint(config.FlagCrawlDuration)) * time.Minute
-
-			fmt.Printf("Starting crawl...\n")
 
 			if err := app.Start(context.Background()); err != nil {
 				return fmt.Errorf("Error starting app: %v", err)

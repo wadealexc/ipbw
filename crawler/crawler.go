@@ -30,7 +30,7 @@ type Crawler struct {
 	ID  *identify.IDService
 	PS  peerstore.Peerstore
 
-	*Report // Aggregates crawl data
+	peers map[peer.ID]*Peer
 
 	// We receive QueryEvents from the DHT on this channel
 	events    <-chan *routing.QueryEvent
@@ -40,10 +40,17 @@ type Crawler struct {
 	workerCtx    context.Context
 	workerCancel context.CancelFunc
 
-	// Used by modules to receive Events from the crawl
-	listeners []context.Context
+	// Maps a crawler EventType to a list of listeners
+	listenersByType map[EventType][]context.Context
 
 	numWorkers uint
+
+	setupDone bool // Used to check that we did setup
+}
+
+type crawlSubscriber struct {
+	ctx   context.Context
+	types map[EventType]bool
 }
 
 type crawlerParams struct {
@@ -61,15 +68,13 @@ func NewCrawler(params crawlerParams, lc fx.Lifecycle) (*Crawler, error) {
 	workerCtx, workerCancel := context.WithCancel(context.Background())
 
 	crawler := &Crawler{
-		Report: &Report{
-			Peers: make(map[peer.ID]*Peer),
-		},
-		dhtCtx:       dhtCtx,
-		dhtCancel:    dhtCancel,
-		events:       events,
-		workerCtx:    workerCtx,
-		workerCancel: workerCancel,
-		listeners:    make([]context.Context, 0),
+		peers:           make(map[peer.ID]*Peer),
+		dhtCtx:          dhtCtx,
+		dhtCancel:       dhtCancel,
+		events:          events,
+		workerCtx:       workerCtx,
+		workerCancel:    workerCancel,
+		listenersByType: make(map[EventType][]context.Context),
 	}
 
 	lc.Append(fx.Hook{
@@ -87,21 +92,27 @@ func NewCrawler(params crawlerParams, lc fx.Lifecycle) (*Crawler, error) {
 	return crawler, nil
 }
 
-// SetNumWorkers sets the number of processes that will be launched to query the DHT
-func (c *Crawler) SetNumWorkers(numWorkers uint) error {
-	if numWorkers == 0 {
-		return fmt.Errorf("Cannot query DHT without workers")
+func (c *Crawler) Setup(numWorkers uint) error {
+	if c.setupDone {
+		return fmt.Errorf("Crawler completed setup twice")
+	} else if numWorkers == 0 {
+		return fmt.Errorf("Expected nonzero number of workers")
 	}
+
 	c.numWorkers = numWorkers
+	c.setupDone = true
 	return nil
 }
 
-// AddListener adds a listener to the crawler
-// The returned channel will emit events from the crawl
-func (c *Crawler) AddListener(ctx context.Context) (context.Context, <-chan *Event) {
+func (c *Crawler) NewListener(eType EventType) (context.CancelFunc, <-chan Event) {
+	ctx, cancel := context.WithCancel(context.Background())
 	ctx, events := RegisterForEvents(ctx)
-	c.listeners = append(c.listeners, ctx)
-	return ctx, events
+
+	// Crawler remembers the context, which will be used to send the events
+	c.listenersByType[eType] = append(c.listenersByType[eType], ctx)
+
+	// We return the CancelFunc and channel, as those are used to listen / cancel
+	return cancel, events
 }
 
 // Build the crawler: start libp2p node and open a DB for our DHT
@@ -151,8 +162,8 @@ func (c *Crawler) build() error {
 // - workers to query the DHT
 // - an aggregator to collect results from worker queries
 func (c *Crawler) start() error {
-	if c.numWorkers == 0 {
-		return fmt.Errorf("Expected nonzero NumWorkers")
+	if !c.setupDone {
+		return fmt.Errorf("Expected crawler to be set up before start")
 	}
 
 	for i := 0; i < int(c.numWorkers); i++ {
@@ -164,8 +175,6 @@ func (c *Crawler) start() error {
 }
 
 func (c *Crawler) stop() error {
-	fmt.Printf("Stopping crawler...\n")
-
 	c.dhtCancel()
 	c.workerCancel()
 
@@ -196,58 +205,57 @@ Work:
 	goto Work
 }
 
-// Collects results from DHT QueryEvents into our Report
+// Collects results from DHT QueryEvents
 func (c *Crawler) aggregator() {
 	// Get our PeerID, so we can filter responses that come from our own node
 	self := c.DHT.PeerID()
 
-	for report := range c.events {
+	for event := range c.events {
 
 		// Check if we've been told to stop
 		if c.workerCtx.Err() != nil {
 			return
 		}
 
-		if report.Type == routing.QueryError {
-			c.publish(&Event{
-				Type:  DHTQueryError,
-				Extra: report.Extra,
-			})
+		if event.Type == routing.QueryError {
+			c.publishQueryError(event.Extra)
 			continue
-		} else if report.Type != routing.PeerResponse {
+		} else if event.Type != routing.PeerResponse {
 			continue
 		}
 
 		// Get reporting peer, the IDs/Addrs they reported, and a timestamp
-		reporter := report.ID
-		response := c.filterSelf(self, report)
+		reporter := event.ID
+		response := c.filterSelf(self, event)
 		timestamp := time.Now().UTC().String()
+		// Remember newly-discovered peers
+		newPeers := make([]peer.ID, 0)
 
 		// No responses? Skip!
 		if len(response) == 0 {
 			continue
 		}
 
-		c.Report.Mu.RLock() // Lock for reads
-
-		// Check if this reporter exists in our report yet. If not, create an entry:
-		if _, exists := c.Report.Peers[reporter]; !exists {
-			c.Report.Peers[reporter] = &Peer{
+		// Check if we've seen this reporter yet. If not, create an entry:
+		if _, exists := c.peers[reporter]; !exists {
+			c.peers[reporter] = &Peer{
+				ID:         reporter,
 				IsReporter: true,
-				Ips:        make([]string, 0), // TODO we can probably query our PeerStore here
+				Ips:        make([]string, 0),
 				Neighbors:  make([]peer.ID, 0),
 				Timestamp:  timestamp,
 			}
-		} else if !c.Report.Peers[reporter].IsReporter {
+			newPeers = append(newPeers, reporter)
+		} else if !c.peers[reporter].IsReporter {
 			// They exist, but have not been a reporter yet
-			c.Report.Peers[reporter].IsReporter = true
+			c.peers[reporter].IsReporter = true
 		}
 
 		// Query our peerstore to see if we have additional IPs for our reporter
 		addrInfo := c.PS.PeerInfo(reporter)
 		reporterIPs := make([]string, 0)
 		seenIP := map[string]struct{}{}
-		for _, ip := range c.Report.Peers[reporter].Ips {
+		for _, ip := range c.peers[reporter].Ips {
 			if _, seen := seenIP[ip]; !seen {
 				seenIP[ip] = struct{}{}
 				reporterIPs = append(reporterIPs, ip)
@@ -261,7 +269,7 @@ func (c *Crawler) aggregator() {
 			}
 		}
 
-		c.Report.Peers[reporter].Ips = reporterIPs
+		c.peers[reporter].Ips = reporterIPs
 
 		// We need to update our reporter's neighbors with the IDs they just gave us.
 		// First, figure out what neighbors we already know about:
@@ -270,7 +278,7 @@ func (c *Crawler) aggregator() {
 		seenID[reporter] = struct{}{} // No, you aren't your own neighbor
 
 		// Range over already-known neighbors
-		for _, neighbor := range c.Report.Peers[reporter].Neighbors {
+		for _, neighbor := range c.peers[reporter].Neighbors {
 			// Record as neighbor and filter duplicates
 			if _, seen := seenID[neighbor]; !seen {
 				seenID[neighbor] = struct{}{}
@@ -280,10 +288,9 @@ func (c *Crawler) aggregator() {
 
 		// Next, for each newly-reported neighbor:
 		// 1. Record them as one of our reporter's neighbors
-		// 2. Add them to c.report.peers if they don't exist yet
+		// 2. Add them to c.peers if they don't exist yet
 		//    - Record newly-discovered peers so we can publish to any listeners
-		// 3. Update their report entry with the new IPs we have for them
-		newPeers := make([]peer.ID, 0)
+		// 3. Update their entry with the new IPs we have for them
 		for _, peerInfo := range response {
 			// 1. Record as neighbor and filter duplicates
 			if _, seen := seenID[peerInfo.ID]; !seen {
@@ -292,8 +299,9 @@ func (c *Crawler) aggregator() {
 			}
 
 			// 2. If we haven't seen this peer yet, create an entry for them
-			if _, exists := c.Report.Peers[peerInfo.ID]; !exists {
-				c.Report.Peers[peerInfo.ID] = &Peer{
+			if _, exists := c.peers[peerInfo.ID]; !exists {
+				c.peers[peerInfo.ID] = &Peer{
+					ID:        peerInfo.ID,
 					Ips:       make([]string, 0),
 					Neighbors: []peer.ID{reporter}, // Our reporter is the first neighbor
 					Timestamp: timestamp,
@@ -307,7 +315,7 @@ func (c *Crawler) aggregator() {
 			knownIPs := make([]string, 0)
 
 			// Range over already-known IPs
-			for _, ip := range c.Report.Peers[peerInfo.ID].Ips {
+			for _, ip := range c.peers[peerInfo.ID].Ips {
 				// Filter duplicates
 				if _, seen := seenIP[ip]; !seen {
 					seenIP[ip] = struct{}{}
@@ -326,32 +334,56 @@ func (c *Crawler) aggregator() {
 
 			// Finally, add this peer's known IPs to the report:
 			if len(knownIPs) != 0 {
-				c.Report.Peers[peerInfo.ID].Ips = knownIPs
+				c.peers[peerInfo.ID].Ips = knownIPs
 			}
 		}
 
 		// Finally finally, record our reporter's neighbors
 		if len(neighbors) != 0 {
-			c.Report.Peers[reporter].Neighbors = neighbors
+			c.peers[reporter].Neighbors = neighbors
 		}
 
-		// Finally*3, publish an event with our newly-discovered peers
-		if len(newPeers) != 0 {
-			c.publish(&Event{
-				Type:  NewPeers,
-				Peers: newPeers,
-			})
-		}
-
-		// Unlock map for reads
-		c.Report.Mu.RUnlock()
+		// Publish crawl results to listeners:
+		c.publishCrawlResults(newPeers)
 	}
 }
 
-// Iterates over registered listeners and publishes an event to each
-func (c *Crawler) publish(event *Event) {
-	for _, listener := range c.listeners {
-		PublishEvent(listener, event)
+func (c *Crawler) publishQueryError(err string) {
+	for _, listener := range c.listenersByType[DHTQueryError] {
+		PublishEvent(listener, Event{
+			Type:  DHTQueryError,
+			Extra: err,
+		})
+	}
+}
+
+func (c *Crawler) publishCrawlResults(newPeers []peer.ID) {
+	// First, publish IDs of just new peers
+	for _, listener := range c.listenersByType[NewPeers] {
+		PublishEvent(listener, Event{
+			Type:   NewPeers,
+			Result: CrawlResult{NewPeers: newPeers},
+		})
+	}
+
+	// Save some work in case we don't have any listeners
+	if len(c.listenersByType[CrawlResults]) == 0 {
+		return
+	}
+
+	result := CrawlResult{
+		AllPeers: make([]Peer, 0),
+	}
+
+	for _, peer := range c.peers {
+		result.AllPeers = append(result.AllPeers, *peer)
+	}
+
+	for _, listener := range c.listenersByType[CrawlResults] {
+		PublishEvent(listener, Event{
+			Type:   CrawlResults,
+			Result: result,
+		})
 	}
 }
 

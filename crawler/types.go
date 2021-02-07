@@ -7,18 +7,18 @@ import (
 	"github.com/libp2p/go-libp2p-core/peer"
 )
 
-// Report aggregates results from QueryEvents
-type Report struct {
-	Mu    sync.RWMutex
-	Peers map[peer.ID]*Peer
-}
-
 // Peer contains all the info we know for a given peer
 type Peer struct {
+	ID         peer.ID
 	IsReporter bool      // Whether this peer reported other peers to us
 	Ips        []string  // All known IPs/ports for this peer
 	Neighbors  []peer.ID // All neighbors this peer reported to us
 	Timestamp  string    // The UTC timestamp when we discovered the peer
+}
+
+type CrawlResult struct {
+	NewPeers []peer.ID
+	AllPeers []Peer
 }
 
 type EventType int
@@ -26,6 +26,8 @@ type EventType int
 const (
 	// NewPeers is emitted when the crawler finds new peers
 	NewPeers EventType = iota
+	// CrawlResults contains the crawler's results so far
+	CrawlResults
 	// DHTQueryError is emitted when we get a QueryError from the DHT
 	// QueryErrors sometimes contain interesting info
 	DHTQueryError
@@ -33,9 +35,9 @@ const (
 
 // Event allows modules to get status updates from the crawler
 type Event struct {
-	Type  EventType
-	Peers []peer.ID
-	Extra string
+	Type   EventType
+	Result CrawlResult
+	Extra  string
 }
 
 type queryKey struct{}
@@ -45,7 +47,7 @@ type queryKey struct{}
 type EventChannel struct {
 	mu  sync.Mutex
 	ctx context.Context
-	ch  chan<- *Event
+	ch  chan<- Event
 }
 
 // waitThenClose is spawned in a goroutine when the channel is registered. This
@@ -62,7 +64,7 @@ func (e *EventChannel) waitThenClose() {
 
 // Sends an event on the event channel, aborting if either the passed or
 // the internal context expire
-func (e *EventChannel) send(ctx context.Context, ev *Event) {
+func (e *EventChannel) send(ctx context.Context, ev Event) {
 	e.mu.Lock()
 	// Closed.
 	if e.ch == nil {
@@ -82,8 +84,8 @@ func (e *EventChannel) send(ctx context.Context, ev *Event) {
 // The returned context can be provided to the crawler to receive Events on the
 // returned channel
 // The passed context MUST be canceled when the caller is no longer interested
-func RegisterForEvents(ctx context.Context) (context.Context, <-chan *Event) {
-	ch := make(chan *Event, 16)
+func RegisterForEvents(ctx context.Context) (context.Context, <-chan Event) {
+	ch := make(chan Event, 16)
 	ech := &EventChannel{
 		ch:  ch,
 		ctx: ctx,
@@ -94,7 +96,7 @@ func RegisterForEvents(ctx context.Context) (context.Context, <-chan *Event) {
 
 // PublishEvent publishes an event to the event channel
 // associated with the given context, if any.
-func PublishEvent(ctx context.Context, ev *Event) {
+func PublishEvent(ctx context.Context, ev Event) {
 	ich := ctx.Value(queryKey{})
 	if ich == nil {
 		return

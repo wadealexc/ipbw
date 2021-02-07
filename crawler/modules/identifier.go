@@ -18,17 +18,19 @@ type Identifier struct {
 
 	// Events / cancel used to listen to crawler
 	crawlCancel context.CancelFunc
-	crawlEvents <-chan *crawler.Event
+	crawlEvents <-chan crawler.Event
 
 	// Ctx / cancel for our workers
 	iCtx    context.Context
 	iCancel context.CancelFunc
 
-	*report
+	report   *iReport
 	supports map[peer.ID][]string
+
+	setupDone bool // Used to check that we did setup
 }
 
-type report struct {
+type iReport struct {
 	mu    sync.RWMutex
 	peers []peer.ID
 }
@@ -40,9 +42,13 @@ type identifierParams struct {
 
 func NewIdentifier(params identifierParams, lc fx.Lifecycle) (*Identifier, error) {
 
+	ctx, cancel := context.WithCancel(context.Background())
+
 	i := &Identifier{
 		Crawler: params.Crawler,
-		report: &report{
+		iCtx:    ctx,
+		iCancel: cancel,
+		report: &iReport{
 			peers: make([]peer.ID, 0),
 		},
 		supports: make(map[peer.ID][]string),
@@ -61,29 +67,31 @@ func NewIdentifier(params identifierParams, lc fx.Lifecycle) (*Identifier, error
 }
 
 func (i *Identifier) Setup() error {
-	ctx, cancel := context.WithCancel(context.Background())
-	_, events := i.Crawler.AddListener(ctx)
+	if i.setupDone {
+		return fmt.Errorf("Identifier completed setup twice")
+	}
 
-	iCtx, iCancel := context.WithCancel(context.Background())
-
+	// Register a new listener with the crawler
+	// The crawler will send us new peers on the returned channel
+	cancel, events := i.Crawler.NewListener(crawler.NewPeers)
 	i.crawlCancel = cancel
 	i.crawlEvents = events
 
-	i.iCtx = iCtx
-	i.iCancel = iCancel
-
+	i.setupDone = true
 	return nil
 }
 
 func (i *Identifier) start() error {
+	if !i.setupDone {
+		return fmt.Errorf("Expected identifier to be set up before start")
+	}
+
 	go i.listener()
-	go i.informant()
+	go i.aggregator()
 	return nil
 }
 
 func (i *Identifier) stop() error {
-	fmt.Printf("Stopping interrogator...\n")
-
 	i.iCancel()
 	i.crawlCancel()
 
@@ -107,13 +115,8 @@ func (i *Identifier) listener() {
 			return
 		}
 
-		if event.Type == crawler.DHTQueryError {
-			// fmt.Printf("Got DHTQueryError: %s\n", event.Extra)
-			continue
-		}
-
 		if event.Type != crawler.NewPeers {
-			fmt.Printf("Wait, how? Event: %v\n", event)
+			fmt.Printf("Expected NewPeers, got: %v\n", event)
 			continue
 		}
 
@@ -121,7 +124,7 @@ func (i *Identifier) listener() {
 		i.report.mu.RLock()
 
 		// Iterate over received peers and add to report
-		for _, peer := range event.Peers {
+		for _, peer := range event.Result.NewPeers {
 			if _, seen := seenID[peer]; seen {
 				fmt.Printf("Crawler claims peer %s is new, but it's a lie!\n", peer)
 				continue
@@ -135,7 +138,7 @@ func (i *Identifier) listener() {
 }
 
 // Aggregates protocols supported by peers we've collected from the crawler
-func (i *Identifier) informant() {
+func (i *Identifier) aggregator() {
 	// We'll query our peerstore every 30 seconds
 	duration := time.Duration(30) * time.Second
 

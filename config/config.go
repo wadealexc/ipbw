@@ -28,6 +28,12 @@ const (
 
 	// modules/identifier
 	FlagEnableIdentifier = "enable-identifier"
+
+	// modules/reporter
+	FlagEnableReporter        = "enable-reporter"
+	FlagReportInterval        = "report-interval"
+	FlagReportPublishEndpoint = "report-endpoint"
+	FlagReportPingEndpoint    = "report-ping"
 )
 
 // Default returns a Config that sets up the crawler
@@ -37,10 +43,10 @@ func Default(cctx *cli.Context) *Config {
 	config := &Config{
 		Modules: []fx.Option{fx.Provide(crawler.NewCrawler)},
 		Invokes: []fx.Option{fx.Invoke(func(c *crawler.Crawler) error {
-			return c.SetNumWorkers(cctx.Uint(FlagNumWorkers))
+			return c.Setup(cctx.Uint(FlagNumWorkers))
 		})},
 		hello: []string{
-			"IPBW config:\n",
+			"IPBW - starting crawl with config:\n",
 			"====================\n",
 			fmt.Sprintf("number of workers: %d\n", cctx.Uint(FlagNumWorkers)),
 			fmt.Sprintf("crawl duration: %d min\n", cctx.Uint(FlagCrawlDuration)),
@@ -56,7 +62,7 @@ func (c *Config) ConfigStatus(cctx *cli.Context) {
 	if cctx.Bool(FlagEnableStatus) {
 		c.Modules = append(c.Modules, fx.Provide(modules.NewStatus))
 		c.Invokes = append(c.Invokes, fx.Invoke(func(s *modules.Status) error {
-			return s.SetInterval(cctx.Uint(FlagStatusInterval))
+			return s.Setup(cctx.Uint(FlagStatusInterval))
 		}))
 		c.hello = append(c.hello,
 			"modules/status: enabled\n",
@@ -78,8 +84,27 @@ func (c *Config) ConfigIdentifier(cctx *cli.Context) {
 	}
 }
 
-// Hello prints a summary of config to the console
-func (c *Config) Hello() {
+func (c *Config) ConfigReporter(cctx *cli.Context) {
+	if cctx.Bool(FlagEnableReporter) {
+		c.Modules = append(c.Modules, fx.Provide(modules.NewReporter))
+		c.Invokes = append(c.Invokes, fx.Invoke(func(r *modules.Reporter) error {
+			return r.Setup(
+				cctx.Uint(FlagReportInterval),
+				cctx.String(FlagReportPublishEndpoint),
+				cctx.String(FlagReportPingEndpoint),
+			)
+		}))
+		c.hello = append(c.hello,
+			"modules/reporter: enabled\n",
+			fmt.Sprintf("- report interval: %d min\n", cctx.Uint(FlagReportInterval)),
+			fmt.Sprintf("- report publish endpoint: %s\n", cctx.String(FlagReportPublishEndpoint)),
+			fmt.Sprintf("- report ping endpoint: %s\n", cctx.String(FlagReportPingEndpoint)),
+		)
+	}
+}
+
+// PrintHello prints a summary of config to the console
+func (c *Config) PrintHello() {
 	hello := strings.Join(c.hello, "")
 	fmt.Printf(hello)
 	fmt.Printf("====================\n")
