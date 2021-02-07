@@ -13,6 +13,7 @@ import (
 
 var (
 	crawlDuration   = flag.Uint("d", 5, "(Optional) Number of minutes to crawl. 5 mins by default.")
+	apiKey          = flag.String("a", "", "(REQUIRED) The API key for server authentication")
 	noPublish       = flag.Bool("n", false, "(Optional) If set, will not publish results to the server.")
 	publishInterval = flag.Uint("p", 1, "(Optional) Number of minutes between reports published to server. 1 min by default.")
 	reportInterval  = flag.Uint("r", 1, "(Optional) Number of minutes between reports printed to console. 1 min by default.")
@@ -20,10 +21,10 @@ var (
 )
 
 // Where to publish reports to
-const server = "http://127.0.0.1:8000/crawl"
+const server = "http://127.0.0.1:8000/batch"
 
 // Used to check if the server is running
-const serverPing = "http://127.0.0.1:8000/ping"
+const serverPing = "http://127.0.0.1:8000/healthcheck"
 
 func main() {
 
@@ -44,6 +45,7 @@ func main() {
 		NumWorkers:      *numWorkers,
 		Server:          server,
 		ServerPing:      serverPing,
+		APIKey:          *apiKey,
 	}
 
 	fmt.Printf("IPBW: Starting %d minute crawl with %d workers\n", *crawlDuration, *numWorkers)

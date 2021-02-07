@@ -25,6 +25,9 @@ import (
 	mh "github.com/multiformats/go-multihash"
 )
 
+// Version of the crawler instance
+const Version = "0.1"
+
 // Crawler holds info about an active crawl
 type Crawler struct {
 	// IPFS / libp2p fields
@@ -67,6 +70,7 @@ type Options struct {
 	NumWorkers      uint   // Number of goroutines to query the DHT with
 	Server          string // Endpoint to publish results to
 	ServerPing      string // Endpoint to check if server is running
+	APIKey          string // API key to authenticate with to the report server
 }
 
 // NewCrawler starts our libp2p node and bootstraps connections
@@ -390,7 +394,18 @@ func (c *Crawler) publishResults() (string, error) {
 		return "", err
 	}
 
-	resp, err := http.Post(c.opts.Server, "application/json", bytes.NewBuffer(reportBody))
+	client := &http.Client{}
+
+	req, err := http.NewRequest("POST", c.opts.Server, bytes.NewBuffer(reportBody))
+	if err != nil {
+		return "", err
+	}
+
+	req.Header.Add("User-Agent", fmt.Sprintf("ipbw-go-%s", Version))
+	req.Header.Add("Authorization", c.opts.APIKey)
+
+	resp, err := client.Do(req)
+
 	if err != nil {
 		return "", err
 	}
@@ -446,7 +461,18 @@ func (c *Crawler) getResults() Results {
 }
 
 func (c *Crawler) pingServer() (string, error) {
-	resp, err := http.Get(c.opts.ServerPing)
+	client := &http.Client{}
+
+	req, err := http.NewRequest("GET", c.opts.ServerPing, bytes.NewBuffer(nil))
+	if err != nil {
+		return "", err
+	}
+
+	req.Header.Add("User-Agent", fmt.Sprintf("ipbw-go-%s", Version))
+	req.Header.Add("Authorization", c.opts.APIKey)
+
+	resp, err := client.Do(req)
+
 	if err != nil {
 		return "", err
 	}
@@ -482,7 +508,7 @@ func filterSelf(self peer.ID, report *routing.QueryEvent) []*peer.AddrInfo {
 
 // Iterates over a collection of multiaddrs and attempts to find ip+port combos
 func filterIPs(addrs []ma.Multiaddr) []string {
-	var results []string = make([]string, 0)
+	var results = make([]string, 0)
 	for _, addr := range addrs {
 		fields := strings.Split(addr.String(), "/")
 
