@@ -112,6 +112,14 @@ func (r *Reporter) start() error {
 		return fmt.Errorf("Expected reporter to be set up before start")
 	}
 
+	// Make sure server is running
+	response, err := r.pingServer()
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("Server says: %s\n", response)
+
 	go r.listener()
 	go r.reporter()
 	return nil
@@ -216,4 +224,20 @@ func (r *Reporter) reporter() {
 			resp.Body.Close()
 		}
 	}
+}
+
+func (r *Reporter) pingServer() (string, error) {
+	resp, err := http.Get(r.pingEndpoint)
+	if err != nil {
+		return "", fmt.Errorf("Got error pinging server: %v", err)
+	}
+
+	defer resp.Body.Close()
+
+	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("Got error decoding server response: %v", err)
+	}
+
+	return string(body), nil
 }
