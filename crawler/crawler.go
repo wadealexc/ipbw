@@ -46,9 +46,11 @@ type Crawler struct {
 	// Maps a crawler EventType to a list of listeners
 	listenersByType map[EventType][]context.Context
 
-	numWorkers uint
+	numWorkers    uint
+	crawlDuration time.Duration
 
-	setupDone bool // Used to check that we did setup
+	setupDone  bool // Used to check that we did setup
+	shutdowner fx.Shutdowner
 }
 
 type crawlSubscriber struct {
@@ -61,7 +63,7 @@ type crawlerParams struct {
 }
 
 // NewCrawler instantiates our libp2p node and dht database
-func NewCrawler(params crawlerParams, lc fx.Lifecycle) (*Crawler, error) {
+func NewCrawler(params crawlerParams, lc fx.Lifecycle, sd fx.Shutdowner) (*Crawler, error) {
 
 	// Create a context that, when passed to DHT queries, emits QueryEvents to a channel
 	dhtCtx, dhtCancel := context.WithCancel(context.Background())
@@ -78,6 +80,7 @@ func NewCrawler(params crawlerParams, lc fx.Lifecycle) (*Crawler, error) {
 		workerCtx:       workerCtx,
 		workerCancel:    workerCancel,
 		listenersByType: make(map[EventType][]context.Context),
+		shutdowner:      sd,
 	}
 
 	lc.Append(fx.Hook{
@@ -95,7 +98,7 @@ func NewCrawler(params crawlerParams, lc fx.Lifecycle) (*Crawler, error) {
 	return crawler, nil
 }
 
-func (c *Crawler) Setup(numWorkers uint) error {
+func (c *Crawler) Setup(numWorkers uint, crawlDuration uint) error {
 	if c.setupDone {
 		return fmt.Errorf("Crawler completed setup twice")
 	} else if numWorkers == 0 {
@@ -103,6 +106,7 @@ func (c *Crawler) Setup(numWorkers uint) error {
 	}
 
 	c.numWorkers = numWorkers
+	c.crawlDuration = time.Duration(crawlDuration) * time.Minute
 	c.setupDone = true
 	return nil
 }
@@ -174,6 +178,12 @@ func (c *Crawler) start() error {
 	}
 
 	go c.aggregator()
+
+	// If a crawl duration wasn't specified, the crawler runs forever
+	if c.crawlDuration != 0 {
+		go c.waitForShutdown()
+	}
+
 	return nil
 }
 
@@ -348,6 +358,17 @@ func (c *Crawler) aggregator() {
 
 		// Publish crawl results to listeners:
 		c.publishCrawlResults(newPeers)
+	}
+}
+
+func (c *Crawler) waitForShutdown() {
+	select {
+	case <-time.After(c.crawlDuration):
+		fmt.Printf("Time elapsed; shutting down...\n")
+		err := c.shutdowner.Shutdown()
+		if err != nil {
+			panic(fmt.Sprintf("Got error on shutdown: %v", err))
+		}
 	}
 }
 

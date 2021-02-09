@@ -19,17 +19,42 @@ COMMANDS:
    help, h  Shows a list of commands or help for one command
 
 GLOBAL OPTIONS:
-   --crawl-duration value, -d value     specify the number of minutes the crawler should run for (default: 5)
-   --num-workers value, -n value        specify the number of goroutines used to query the DHT (default: 8)
-   --enable-status, -s                  specify whether the crawler should output occasional status updates to console. (default: true)
-   --status-interval value, --si value  how often (in minutes) status updates will be posted (default: 1)
-   --enable-identifier, -i              enables the identifier module (default: false)
-   --enable-reporter, -r                enables the reporter module, which publishes results to a server (default: false)
-   --report-interval value, --ri value  how often (in minutes) the reporter will publish crawl results to the server (default: 1)
-   --report-endpoint value, --re value  the url/endpoint the reporter will publish crawl results to (default: "http://127.0.0.1:8000/batch")
-   --report-ping value, --rp value      the url/endpoint the reporter will ping on startup to ensure the server is running (default: "http://127.0.0.1:8000/healthcheck")
-   --report-api-key value, -a value   the API key used to authenticate the reporter's reports
-   --help, -h                           show help (default: false)
+   -c FILE           load config from FILE, ignoring any other set flags
+   -d NUM_MINUTES    specify NUM_MINUTES to run the crawler. 0 will run in endless mode. (default: 0)
+   -w value          specify the number of goroutines used to query the DHT (default: 8)
+   -s, --status      specify whether the crawler should output occasional status updates to console. (default: false)
+   -i, --identifier  enables the identifier module (default: false)
+   -r, --reporter    enables the reporter module, which publishes results to a server (default: false)
+   --help, -h        show help (default: false)
+```
+
+### Reading config from file
+
+Instead of using CLI flags, the crawler can be configured via JSON file. To read from JSON, run the crawler like this:
+
+`./ipbw -c example.json`
+
+Here's an example config file:
+
+```json
+{
+   "numWorkers": 8,
+   "crawlDuration": 10, // Omit, or set to 0 for endless mode
+   "modules": { // Modules are optional - omit any module to run without it
+      "status": {
+         "interval": 1 // As with the CLI flags, intervals describe a "number of minutes"
+      },
+      "reporter": {
+         "interval": 1,
+         "publishEndpoint": "http://127.0.0.1:8000/batch",
+         "pingEndpoint": "http://127.0.0.1:8000/healthcheck",
+         "apiKey": "EXAMPLE_KEY"
+      },
+      "identifier": {
+         "interval": 1
+      }
+   }
+}
 ```
 
 ## Output
