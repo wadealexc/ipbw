@@ -24,6 +24,7 @@ type Identifier struct {
 	iCtx    context.Context
 	iCancel context.CancelFunc
 
+	interval time.Duration
 	report   *iReport
 	supports map[peer.ID][]string
 
@@ -66,9 +67,11 @@ func NewIdentifier(params identifierParams, lc fx.Lifecycle) (*Identifier, error
 	return i, nil
 }
 
-func (i *Identifier) Setup() error {
+func (i *Identifier) Setup(interval uint) error {
 	if i.setupDone {
 		return fmt.Errorf("Identifier completed setup twice")
+	} else if interval == 0 {
+		return fmt.Errorf("Expected nonzero interval")
 	}
 
 	// Register a new listener with the crawler
@@ -76,6 +79,8 @@ func (i *Identifier) Setup() error {
 	cancel, events := i.Crawler.NewListener(crawler.NewPeers)
 	i.crawlCancel = cancel
 	i.crawlEvents = events
+
+	i.interval = time.Duration(interval) * time.Minute
 
 	i.setupDone = true
 	return nil
@@ -139,9 +144,6 @@ func (i *Identifier) listener() {
 
 // Aggregates protocols supported by peers we've collected from the crawler
 func (i *Identifier) aggregator() {
-	// We'll query our peerstore every 30 seconds
-	duration := time.Duration(30) * time.Second
-
 	for {
 		// Check if we've been told to stop
 		if i.iCtx.Err() != nil {
@@ -149,7 +151,7 @@ func (i *Identifier) aggregator() {
 		}
 
 		select {
-		case <-time.After(duration):
+		case <-time.After(i.interval):
 			results := i.queryProtocols()
 			i.printUpdate(results)
 		}
