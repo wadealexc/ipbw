@@ -32,7 +32,8 @@ const (
 	FlagStatusInterval = "status-interval"
 
 	// modules/identifier
-	FlagEnableIdentifier = "i"
+	FlagEnableIdentifier   = "i"
+	FlagIdentifierInterval = "identifier-interval"
 
 	// modules/reporter
 	FlagEnableReporter        = "r"
@@ -72,6 +73,13 @@ var Flags = []cli.Flag{
 		Name:    FlagEnableIdentifier,
 		Aliases: []string{"identifier"},
 		Usage:   "enables the identifier module",
+	},
+	&cli.UintFlag{
+		Name:    FlagIdentifierInterval,
+		Aliases: []string{"ii"},
+		Value:   1,
+		Hidden:  true,
+		Usage:   "specify `NUM_MINUTES` between identifier output",
 	},
 	&cli.BoolFlag{
 		Name:    FlagEnableReporter,
@@ -231,10 +239,11 @@ func fromFile(fileName string) (*Config, error) {
 	if cfgJSON.Modules.Identifier != nil {
 		c.Modules = append(c.Modules, fx.Provide(modules.NewIdentifier))
 		c.Invokes = append(c.Invokes, fx.Invoke(func(i *modules.Identifier) error {
-			return i.Setup()
+			return i.Setup(cfgJSON.Modules.Identifier.Interval)
 		}))
 		c.hello = append(c.hello,
 			"modules/identifier: enabled\n",
+			fmt.Sprintf("- identifier interval: %d min\n", cfgJSON.Modules.Identifier.Interval),
 		)
 	}
 
@@ -298,10 +307,11 @@ func (c *Config) configIdentifier(cctx *cli.Context) {
 	if cctx.Bool(FlagEnableIdentifier) {
 		c.Modules = append(c.Modules, fx.Provide(modules.NewIdentifier))
 		c.Invokes = append(c.Invokes, fx.Invoke(func(i *modules.Identifier) error {
-			return i.Setup()
+			return i.Setup(cctx.Uint(FlagIdentifierInterval))
 		}))
 		c.hello = append(c.hello,
 			"modules/identifier: enabled\n",
+			fmt.Sprintf("- identifier interval: %d min\n", cctx.Uint(FlagIdentifierInterval)),
 		)
 	}
 }
