@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/libp2p/go-libp2p-core/event"
 	peer "github.com/libp2p/go-libp2p-peer"
 	"github.com/wadeAlexC/ipbw/crawler"
 	"go.uber.org/fx"
@@ -15,6 +16,8 @@ import (
 
 type Identifier struct {
 	*crawler.Crawler
+
+	idEvents event.Subscription
 
 	// Events / cancel used to listen to crawler
 	crawlCancel context.CancelFunc
@@ -28,7 +31,14 @@ type Identifier struct {
 	report   *iReport
 	supports map[peer.ID][]string
 
+	*pReport
+
 	setupDone bool // Used to check that we did setup
+}
+
+type pReport struct {
+	mu         sync.RWMutex
+	userAgents map[string]uint
 }
 
 type iReport struct {
@@ -51,6 +61,9 @@ func NewIdentifier(params identifierParams, lc fx.Lifecycle) (*Identifier, error
 		iCancel: cancel,
 		report: &iReport{
 			peers: make([]peer.ID, 0),
+		},
+		pReport: &pReport{
+			userAgents: make(map[string]uint),
 		},
 		supports: make(map[peer.ID][]string),
 	}
@@ -91,7 +104,20 @@ func (i *Identifier) start() error {
 		return fmt.Errorf("Expected identifier to be set up before start")
 	}
 
+	// Set stream handler to "match all"
+	// i.Crawler.Host.SetStreamHandlerMatch("/fil/hello/1.0.0", func(string) bool {
+	// 	return true
+	// }, i.HandleStream)
+
+	// Subscribe to events emitted when we complete identity protocol w/ peer
+	idEvents, err := i.Crawler.Host.EventBus().Subscribe(&event.EvtPeerIdentificationCompleted{})
+	if err != nil {
+		return fmt.Errorf("Got error subscribing to events: %v", err)
+	}
+	i.idEvents = idEvents
+
 	go i.listener()
+	go i.versioner()
 	go i.aggregator()
 	return nil
 }
@@ -142,6 +168,27 @@ func (i *Identifier) listener() {
 	}
 }
 
+func (i *Identifier) versioner() {
+
+	for e := range i.idEvents.Out() {
+		event := e.(event.EvtPeerIdentificationCompleted)
+
+		// Get UserAgent from Peerstore
+		av, err := i.Crawler.PS.Get(event.Peer, "AgentVersion")
+		if err != nil {
+			fmt.Printf("Got error querying agent version for peer %s: %v; skipping\n", event.Peer, err)
+			continue
+		}
+		agentVersion := av.(string)
+
+		i.pReport.mu.RLock()
+
+		i.pReport.userAgents[agentVersion]++
+
+		i.pReport.mu.RUnlock()
+	}
+}
+
 // Aggregates protocols supported by peers we've collected from the crawler
 func (i *Identifier) aggregator() {
 	for {
@@ -157,6 +204,18 @@ func (i *Identifier) aggregator() {
 		}
 	}
 }
+
+// func (i *Identifier) HandleStream(stream network.Stream) {
+// 	go func() {
+// 		i.pReport.mu.RLock()
+
+// 		if _, seen := i.pReport.protos[string(stream.Protocol())]; !seen {
+// 			i.pReport.protos[string(stream.Protocol())] = struct{}{}
+// 		}
+
+// 		i.pReport.mu.RUnlock()
+// 	}()
+// }
 
 type iResults struct {
 	mostProtocols peer.ID         // Peer that supports the most protocols
@@ -176,20 +235,10 @@ func (i *Identifier) queryProtocols() *iResults {
 	// Iterate over all reported peers and check our peerstore for each
 	for _, peer := range i.report.peers {
 		protos, err := i.Crawler.PS.GetProtocols(peer)
-
 		if err != nil {
 			fmt.Printf("Got error querying protocols for peer %s: %v; skipping\n", peer, err)
 			continue
 		}
-
-		if len(protos) == 0 {
-			continue
-		}
-
-		// Create entry if it doesn't exist
-		// if _, exists := i.supports[peer]; !exists {
-		// 	i.supports[peer] = make([]string, 0)
-		// }
 
 		// Figure out what protocols we've already seen for this peer
 		seenProto := map[string]struct{}{}
@@ -254,6 +303,14 @@ func (i *Identifier) printUpdate(res *iResults) {
 	for _, entry := range list {
 		outputArr = append(outputArr, fmt.Sprintf("%s -> %d peers\n", entry.proto, entry.count))
 	}
+
+	i.pReport.mu.Lock()
+	outputArr = append(outputArr, fmt.Sprintf("- %d user agents found\n", len(i.pReport.userAgents)))
+	outputArr = append(outputArr, fmt.Sprintf("- User Agents:\n"))
+	for agent, count := range i.pReport.userAgents {
+		outputArr = append(outputArr, fmt.Sprintf("%s -> %d peers\n", agent, count))
+	}
+	i.pReport.mu.Unlock()
 
 	output := strings.Join(outputArr, "")
 	fmt.Printf(output)

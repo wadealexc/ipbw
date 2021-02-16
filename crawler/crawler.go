@@ -143,7 +143,18 @@ func (c *Crawler) build() error {
 	}
 	c.DS = ds
 
-	c.DHT = dht.NewDHTClient(context.Background(), host, ds)
+	dhtOpts := []dht.Option{
+		dht.Mode(dht.ModeAuto),
+		dht.Datastore(ds),
+		dht.QueryFilter(dht.PublicQueryFilter),
+		dht.RoutingTableFilter(dht.PublicRoutingTableFilter),
+	}
+	DHT, err := dht.New(context.Background(), host, dhtOpts...)
+	if err != nil {
+		return fmt.Errorf("Error creating DHT: %v", err)
+	}
+
+	c.DHT = DHT
 	c.ID = identify.NewIDService(host)
 	c.PS = host.Peerstore()
 
@@ -171,6 +182,12 @@ func (c *Crawler) build() error {
 func (c *Crawler) start() error {
 	if !c.setupDone {
 		return fmt.Errorf("Expected crawler to be set up before start")
+	}
+
+	mux := c.Host.Mux()
+	fmt.Printf("Protocols supported by our node:\n")
+	for _, proto := range mux.Protocols() {
+		fmt.Printf("%s\n", proto)
 	}
 
 	for i := 0; i < int(c.numWorkers); i++ {
