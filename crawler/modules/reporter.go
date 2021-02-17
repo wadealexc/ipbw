@@ -39,14 +39,6 @@ type rReport struct {
 	*ReportJSON
 }
 
-// PeerJSON is a json-marshallable form of Peer
-type PeerJSON struct {
-	Pid       string   `json:"pid"`
-	Ips       []string `json:"ips"`
-	Neighbors []string `json:"neighbors"`
-	Timestamp string   `json:"timestamp"`
-}
-
 type ReportJSON struct {
 	Peers []PeerJSON `json:"peers"`
 }
@@ -103,7 +95,7 @@ func (r *Reporter) Setup(interval uint, publishEndpoint string, pingEndpoint str
 
 	// Register a new listener with the crawler
 	// The crawler will send us CrawlResults on the returned channel
-	cancel, events := r.Crawler.NewListener(crawler.CrawlResults)
+	cancel, events := r.Crawler.Subscribe(crawler.CrawlResults)
 	r.crawlCancel = cancel
 	r.crawlEvents = events
 

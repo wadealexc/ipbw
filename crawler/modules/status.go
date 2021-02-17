@@ -83,7 +83,7 @@ func (s *Status) Setup(interval uint) error {
 
 	// Register a new listener with the crawler
 	// The crawler will send us CrawlResults on the returned channel
-	cancel, events := s.Crawler.NewListener(crawler.CrawlResults)
+	cancel, events := s.Crawler.Subscribe(crawler.CrawlResults)
 	s.crawlCancel = cancel
 	s.crawlEvents = events
 

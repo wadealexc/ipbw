@@ -89,7 +89,7 @@ func (i *Identifier) Setup(interval uint) error {
 
 	// Register a new listener with the crawler
 	// The crawler will send us new peers on the returned channel
-	cancel, events := i.Crawler.NewListener(crawler.NewPeers)
+	cancel, events := i.Crawler.Subscribe(crawler.NewPeers)
 	i.crawlCancel = cancel
 	i.crawlEvents = events
 

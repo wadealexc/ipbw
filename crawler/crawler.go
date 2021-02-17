@@ -111,7 +111,7 @@ func (c *Crawler) Setup(numWorkers uint, crawlDuration uint) error {
 	return nil
 }
 
-func (c *Crawler) NewListener(eType EventType) (context.CancelFunc, <-chan Event) {
+func (c *Crawler) Subscribe(eType EventType) (context.CancelFunc, <-chan Event) {
 	ctx, cancel := context.WithCancel(context.Background())
 	ctx, events := RegisterForEvents(ctx)
 

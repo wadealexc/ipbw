@@ -7,20 +7,6 @@ import (
 	"github.com/libp2p/go-libp2p-core/peer"
 )
 
-// Peer contains all the info we know for a given peer
-type Peer struct {
-	ID         peer.ID
-	IsReporter bool      // Whether this peer reported other peers to us
-	Ips        []string  // All known IPs/ports for this peer
-	Neighbors  []peer.ID // All neighbors this peer reported to us
-	Timestamp  string    // The UTC timestamp when we discovered the peer
-}
-
-type CrawlResult struct {
-	NewPeers []peer.ID
-	AllPeers []Peer
-}
-
 type EventType int
 
 const (
@@ -38,6 +24,11 @@ type Event struct {
 	Type   EventType
 	Result CrawlResult
 	Extra  string
+}
+
+type CrawlResult struct {
+	NewPeers []peer.ID
+	AllPeers []Peer
 }
 
 type queryKey struct{}
