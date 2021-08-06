@@ -12,7 +12,6 @@ import (
 	"github.com/libp2p/go-libp2p-core/network"
 	"github.com/libp2p/go-libp2p-core/peer"
 	"github.com/libp2p/go-msgio"
-	"github.com/multiformats/go-multiaddr"
 )
 
 // PeerTracker keeps track of all the peers we've heard about
@@ -25,15 +24,14 @@ type PeerTracker struct {
 
 	host host.Host
 
-	// Separate peer IDs into SELF, BOOTSTRAP, and KNOWN
-	peers map[peer.ID]PeerType
+	// Contains the peer IDs being used by the crawler
+	self map[peer.ID]struct{}
 
-	// Peers that belong to our crawler
-	self []*Peer
-	// Peer IDs we bootstrapped from
-	bootstrap map[PeerStatus][]*Peer
-	// Peers we have heard about during our crawl
-	known map[PeerStatus][]*Peer
+	// All the unique peers we've seen
+	allSeen map[peer.ID]struct{}
+
+	// All the peers we have not attempted to connect to
+	allConnectable map[peer.ID]*Peer
 
 	stats *TrackerStats
 
@@ -42,9 +40,9 @@ type PeerTracker struct {
 }
 
 type TrackerStats struct {
-	activeStreams int64
-	activeReads   int64
-	activeWrites  int64
+	numConnected int64
+	activeReads  int64
+	activeWrites int64
 
 	messagesSent uint64
 	sentFindNode uint64
@@ -81,11 +79,10 @@ const (
 
 func NewPeerTracker(host host.Host) *PeerTracker {
 	return &PeerTracker{
-		host:      host,
-		peers:     make(map[peer.ID]PeerType),
-		self:      make([]*Peer, 0),
-		bootstrap: make(map[PeerStatus][]*Peer),
-		known:     make(map[PeerStatus][]*Peer),
+		host:           host,
+		self:           make(map[peer.ID]struct{}),
+		allSeen:        make(map[peer.ID]struct{}),
+		allConnectable: make(map[peer.ID]*Peer),
 		stats: &TrackerStats{
 			supportedProtocols: make(map[string]uint64),
 		},
@@ -94,181 +91,98 @@ func NewPeerTracker(host host.Host) *PeerTracker {
 
 // Add our peer ID / addresses / protocols, so we don't accidentally
 // re-add ourselves if we're referred to ourself by another peer
-func (pt *PeerTracker) AddSelf(id peer.ID, addrs []multiaddr.Multiaddr, protocols []string) error {
+func (pt *PeerTracker) AddSelf(id peer.ID) error {
 	pt.mu.Lock()
 	defer pt.mu.Unlock()
 
-	if len(protocols) == 0 {
-		return fmt.Errorf("expected self to have protocols")
+	if _, exists := pt.self[id]; exists {
+		return fmt.Errorf("id %s already exists", id.Pretty())
 	}
 
-	p, err := NewPeer(id, addrs, protocols)
-	if err != nil {
-		return fmt.Errorf("error creating new peer for self: %v", err)
-	}
-
-	// Make sure we don't add twice
-	if _, exists := pt.peers[id]; exists {
-		return fmt.Errorf("tried to add self twice")
-	}
-
-	pt.peers[id] = SELF
-	pt.self = append(pt.self, p)
+	pt.self[id] = struct{}{}
 	return nil
 }
 
-// Add bootstrap peers to tracker. Bootstrap peers don't have a referring peer
-func (pt *PeerTracker) AddBootstrap(id peer.ID, addrs []multiaddr.Multiaddr) error {
+// Add each peer to the peer tracker, returning the number of new peers added
+func (pt *PeerTracker) AddPeers(peers []peer.AddrInfo) (newCount int) {
 	pt.mu.Lock()
 	defer pt.mu.Unlock()
 
-	p, err := NewPeer(id, addrs, nil)
-	if err != nil {
-		return fmt.Errorf("error creating new bootstrap peer: %v", err)
-	}
+	for _, peer := range peers {
+		if _, isSelf := pt.self[peer.ID]; isSelf {
+			fmt.Printf("Attempted to add self to tracker!\n")
+			continue // skip
+		}
 
-	// Make sure we don't add twice
-	if _, exists := pt.peers[id]; exists {
-		return fmt.Errorf("tried to add bootstrap peer twice")
-	}
+		if _, seen := pt.allSeen[peer.ID]; !seen {
+			// Mark peer as seen
+			pt.allSeen[peer.ID] = struct{}{}
+			newCount++
 
-	pt.peers[id] = BOOTSTRAP
-	pt.bootstrap[NOT_CONNECTED] = append(pt.bootstrap[NOT_CONNECTED], p)
-
-	fmt.Printf("Bootstrap peer %s has addrs:%v\n", p.ID.Pretty(), p.Addrs)
-
-	return nil
-}
-
-// Add a peer to the tracker and mark the peer that referred us
-// TODO credit referPeer somehow
-func (pt *PeerTracker) AddReferred(referPeer peer.ID, newPeers []peer.AddrInfo) (selfCount int, newUnique int, err error) {
-	pt.mu.Lock()
-	defer pt.mu.Unlock()
-
-	for _, newPeer := range newPeers {
-		if pt.isSelf(newPeer) {
-			selfCount++
-		} else if !pt.isKnown(newPeer) {
-			newUnique++
-
-			// New unknown peer: add to tracker
-			p, err := NewPeer(newPeer.ID, newPeer.Addrs, nil)
+			// Add peer as connectable
+			connPeer, err := NewPeer(peer)
 			if err != nil {
-				return 0, 0, fmt.Errorf("error adding referred peer to tracker: %v", err)
+				fmt.Printf("Error creating peer: %v\n", err)
+				continue // skip
 			}
 
-			pt.peers[newPeer.ID] = KNOWN
-			pt.known[NOT_CONNECTED] = append(pt.known[NOT_CONNECTED], p)
+			pt.allConnectable[peer.ID] = connPeer
 		}
 	}
 
-	return selfCount, newUnique, nil
+	return newCount
 }
 
-func (pt *PeerTracker) NumActiveStreams() int {
-	activeStreams := 0
-
-	for _, conn := range pt.host.Network().Conns() {
-		for _, stream := range conn.GetStreams() {
-			if stream.Protocol() == DHT_PROTO {
-				activeStreams++
-				break
-			}
-		}
-	}
-
-	return activeStreams
-}
-
-func (pt *PeerTracker) GetTimeElapsed() time.Duration {
+// Attempts to connect to a bootstrap peer, returning an error if unsuccessful
+func (pt *PeerTracker) BootstrapFrom(bPeer peer.AddrInfo) error {
 	pt.mu.Lock()
 	defer pt.mu.Unlock()
 
-	return time.Now().Sub(pt.startTime)
-}
-
-func (pt *PeerTracker) GetActivity() (int64, int64, int64) {
-	streams := int64(pt.NumActiveStreams())
-	reads := atomic.LoadInt64(&pt.stats.activeReads)
-	writes := atomic.LoadInt64(&pt.stats.activeWrites)
-
-	return streams, reads, writes
-}
-
-func (pt *PeerTracker) GetTotalSeen() int {
-	pt.mu.Lock()
-	defer pt.mu.Unlock()
-
-	return len(pt.peers) - len(pt.self)
-}
-
-func (pt *PeerTracker) GetReadsWrites() (uint64, uint64) {
-	numWrites := atomic.LoadUint64(&pt.stats.messagesSent)
-	numReads := atomic.LoadUint64(&pt.stats.messagesRead)
-	return numWrites, numReads
-}
-
-// We have work if we have NOT_CONNECTED peers
-func (pt *PeerTracker) HasWork() bool {
-	pt.mu.Lock()
-	defer pt.mu.Unlock()
-
-	return len(pt.bootstrap[NOT_CONNECTED]) != 0 || len(pt.known[NOT_CONNECTED]) != 0
-}
-
-// Assigns a worker to a NOT_CONNECTED peer
-// Returns an error if we can't connect to any peers
-func (pt *PeerTracker) StartWorker(ctx context.Context) error {
-	pt.mu.Lock()
-	defer pt.mu.Unlock()
-
+	// Record start time
 	if !pt.started {
-		fmt.Printf("Starting first worker!\n")
-		pt.startTime = time.Now()
 		pt.started = true
+		pt.startTime = time.Now()
 	}
 
-	// Yikes, this is verbose! TODO: fix that.
-
-	// Get a NOT_CONNECTED peer, prioritizing bootstrap:
-	for idx, bPeer := range pt.bootstrap[NOT_CONNECTED] {
-		err := pt.tryConnect(ctx, bPeer)
-
-		// Since we've tried to connect to this peer, remove them from NOT_CONNECTED
-		// We're going to place them in CONNECTED or UNREACHABLE
-		pt.bootstrap[NOT_CONNECTED][idx] = pt.bootstrap[NOT_CONNECTED][len(pt.bootstrap[NOT_CONNECTED])-1]
-		pt.bootstrap[NOT_CONNECTED] = pt.bootstrap[NOT_CONNECTED][:len(pt.bootstrap[NOT_CONNECTED])-1]
-
-		if err == nil {
-			pt.bootstrap[CONNECTED] = append(pt.bootstrap[CONNECTED], bPeer)
-			fmt.Printf("Connected to bootstrap peer %s with addrs %v\n", bPeer.ID.Pretty(), bPeer.Addrs)
-			return nil // we connected; we're done
-		} else {
-			pt.bootstrap[UNREACHABLE] = append(pt.bootstrap[UNREACHABLE], bPeer)
-			return fmt.Errorf("error connecting to bootstrap peer: %v", err)
-		}
+	p, err := NewPeer(bPeer)
+	if err != nil {
+		return fmt.Errorf("error creating bootstrap peer: %v", err)
 	}
 
-	// Get a NOT_CONNECTED peer from non-bootstrap peers:
-	for idx, ncPeer := range pt.known[NOT_CONNECTED] {
-		err := pt.tryConnect(ctx, ncPeer)
+	return pt.tryConnect(context.Background(), p)
+}
 
-		// Since we've tried to connect to this peer, remove them from NOT_CONNECTED
-		// We're going to place them in CONNECTED or UNREACHABLE
-		pt.known[NOT_CONNECTED][idx] = pt.known[NOT_CONNECTED][len(pt.known[NOT_CONNECTED])-1]
-		pt.known[NOT_CONNECTED] = pt.known[NOT_CONNECTED][:len(pt.known[NOT_CONNECTED])-1]
+func (pt *PeerTracker) PopConnectable() *Peer {
+	pt.mu.Lock()
+	defer pt.mu.Unlock()
 
-		if err == nil {
-			pt.known[CONNECTED] = append(pt.known[CONNECTED], ncPeer)
-			return nil // we connected; we're done
-		} else {
-			pt.known[UNREACHABLE] = append(pt.known[UNREACHABLE], ncPeer)
-			return fmt.Errorf("error connecting to known peer: %v", err)
-		}
+	// If we don't have any connectable peers, return nil
+	if len(pt.allConnectable) == 0 {
+		return nil
 	}
 
-	return fmt.Errorf("unable to connect to any peers")
+	var pID peer.ID
+	var peer *Peer
+
+	// Map range is a decent way to get random access
+	// ... but this can probably be improved TODO
+	for id, p := range pt.allConnectable {
+		pID = id
+		peer = p
+		break
+	}
+
+	// Remove peer from allConnectable and return
+	delete(pt.allConnectable, pID)
+	return peer
+}
+
+func (pt *PeerTracker) StartWorker(ctx context.Context, peer *Peer) {
+	err := pt.tryConnect(ctx, peer)
+
+	if err != nil {
+		fmt.Printf("Error connecting to peer %s: %v\n", peer.ID.Pretty(), err)
+	}
 }
 
 // Attempt to connect to a peer. Return true if we succeed
@@ -283,6 +197,8 @@ func (pt *PeerTracker) tryConnect(ctx context.Context, peer *Peer) error {
 		cancel()
 		return err
 	}
+
+	atomic.AddInt64(&pt.stats.numConnected, 1)
 
 	// Start workers to read/write for peer
 	ctx, cancel = context.WithCancel(ctx)
@@ -300,14 +216,9 @@ func (pt *PeerTracker) disconnect(ctx context.Context, cancel context.CancelFunc
 		fmt.Printf("Error trying to reset stream for peer %s: %v", peer.ID.Pretty(), err)
 	}
 
+	atomic.AddInt64(&pt.stats.numConnected, -1)
+
 	peer.PrintErrors()
-
-	// Move peer from CONNECTED to DISCONNECTED
-	err = pt.markDisconnected(peer)
-	if err != nil {
-		fmt.Printf("error marking peer as disconnected: %v", err)
-	}
-
 	// Cancel context, which should halt reads / writes
 	cancel()
 }
@@ -339,7 +250,7 @@ func (pt *PeerTracker) doWrites(ctx context.Context, cancel context.CancelFunc, 
 
 			err = writer.WriteMsg(data)
 			if err != nil {
-				peer.LogWriteError("Error writing PING; WriteMsg errored with: %v", err)
+				peer.LogWriteError("Error writing PING; stopping writes: %v", err)
 				return
 			}
 
@@ -358,7 +269,7 @@ func (pt *PeerTracker) doWrites(ctx context.Context, cancel context.CancelFunc, 
 
 			err = writer.WriteMsg(data)
 			if err != nil {
-				peer.LogWriteError("Error writing FIND_NODE; WriteMsg errored with: %v", err)
+				peer.LogWriteError("Error writing FIND_NODE; stopping writes: %v", err)
 				return
 			}
 
@@ -432,6 +343,7 @@ func (pt *PeerTracker) doReads(ctx context.Context, cancel context.CancelFunc, s
 			errCount := peer.LogReadError("NewDHTMsg errored with: %v", err)
 			if errCount > MAX_READ_ERRORS {
 				pt.disconnect(ctx, cancel, s, peer)
+				return
 			}
 			continue
 		}
@@ -450,23 +362,23 @@ func (pt *PeerTracker) doReads(ctx context.Context, cancel context.CancelFunc, s
 
 		// First, check to see if the peer told us about new peers / providers:
 		// TODO do things with the returned values
-		_, _, err = pt.AddReferred(peer.ID, dhtMsg.CloserPeers)
-		if err != nil {
-			errCount := peer.LogReadError("AddReferred(Closer) errored with: %v", err)
-			if errCount > MAX_READ_ERRORS {
-				pt.disconnect(ctx, cancel, s, peer)
-			}
-			continue
-		}
+		pt.AddPeers(dhtMsg.CloserPeers)
+		// if err != nil {
+		// 	errCount := peer.LogReadError("AddReferred(Closer) errored with: %v", err)
+		// 	if errCount > MAX_READ_ERRORS {
+		// 		pt.disconnect(ctx, cancel, s, peer)
+		// 	}
+		// 	continue
+		// }
 
-		_, _, err = pt.AddReferred(peer.ID, dhtMsg.ProviderPeers)
-		if err != nil {
-			errCount := peer.LogReadError("AddReferred(Provider) errored with: %v", err)
-			if errCount > MAX_READ_ERRORS {
-				pt.disconnect(ctx, cancel, s, peer)
-			}
-			continue
-		}
+		pt.AddPeers(dhtMsg.ProviderPeers)
+		// if err != nil {
+		// 	errCount := peer.LogReadError("AddReferred(Provider) errored with: %v", err)
+		// 	if errCount > MAX_READ_ERRORS {
+		// 		pt.disconnect(ctx, cancel, s, peer)
+		// 	}
+		// 	continue
+		// }
 
 		// TODO: perform more validation on reads - ex, IPNS sig validation / PK validation
 
@@ -485,6 +397,7 @@ func (pt *PeerTracker) doReads(ctx context.Context, cancel context.CancelFunc, s
 				errCount := peer.LogReadError("PUT_VALUE: key mismatch. Expected %s == %s", dhtMsg.Key, dhtMsg.Record.Key)
 				if errCount > MAX_READ_ERRORS {
 					pt.disconnect(ctx, cancel, s, peer)
+					return
 				}
 				continue
 			}
@@ -529,6 +442,7 @@ func (pt *PeerTracker) doReads(ctx context.Context, cancel context.CancelFunc, s
 			errCount := peer.LogReadError("invalid message type: %d", dhtMsg.Type)
 			if errCount > MAX_READ_ERRORS {
 				pt.disconnect(ctx, cancel, s, peer)
+				return
 			}
 			continue
 		}
@@ -538,58 +452,45 @@ func (pt *PeerTracker) doReads(ctx context.Context, cancel context.CancelFunc, s
 	}
 }
 
-func (pt *PeerTracker) isSelf(peer peer.AddrInfo) bool {
-	for _, self := range pt.self {
-		if self.ID == peer.ID {
-			return true
+func (pt *PeerTracker) NumActiveStreams() int {
+	activeStreams := 0
+
+	for _, conn := range pt.host.Network().Conns() {
+		for _, stream := range conn.GetStreams() {
+			if stream.Protocol() == DHT_PROTO {
+				activeStreams++
+				break
+			}
 		}
 	}
 
-	return false
+	return activeStreams
 }
 
-func (pt *PeerTracker) isKnown(peer peer.AddrInfo) bool {
-	_, exists := pt.peers[peer.ID]
-	return exists
-}
-
-// TODO: messy af
-func (pt *PeerTracker) markDisconnected(peer *Peer) error {
+func (pt *PeerTracker) GetTimeElapsed() time.Duration {
 	pt.mu.Lock()
 	defer pt.mu.Unlock()
 
-	pType := pt.peers[peer.ID]
-	if pType == BOOTSTRAP {
-		// Check in CONNECTED:
-		for idx, bPeer := range pt.bootstrap[CONNECTED] {
-			// Found peer - move to DISCONNECTED
-			if bPeer.ID == peer.ID {
-				// Remove from CONNECTED
-				pt.bootstrap[CONNECTED][idx] = pt.bootstrap[CONNECTED][len(pt.bootstrap[CONNECTED])-1]
-				pt.bootstrap[CONNECTED] = pt.bootstrap[CONNECTED][:len(pt.bootstrap[CONNECTED])-1]
+	return time.Since(pt.startTime)
+}
 
-				// Append to DISCONNECTED
-				pt.bootstrap[DISCONNECTED] = append(pt.bootstrap[DISCONNECTED], peer)
-				return nil
-			}
-		}
-	} else if pType == KNOWN {
-		// Check in CONNECTED:
-		for idx, bPeer := range pt.known[CONNECTED] {
-			// Found peer - move to DISCONNECTED
-			if bPeer.ID == peer.ID {
-				// Remove from CONNECTED
-				pt.known[CONNECTED][idx] = pt.known[CONNECTED][len(pt.known[CONNECTED])-1]
-				pt.known[CONNECTED] = pt.known[CONNECTED][:len(pt.known[CONNECTED])-1]
+func (pt *PeerTracker) GetActivity() (int64, int64, int64) {
+	outboundConns := atomic.LoadInt64(&pt.stats.numConnected)
+	reads := atomic.LoadInt64(&pt.stats.activeReads)
+	writes := atomic.LoadInt64(&pt.stats.activeWrites)
 
-				// Append to DISCONNECTED
-				pt.known[DISCONNECTED] = append(pt.known[DISCONNECTED], peer)
-				return nil
-			}
-		}
-	} else {
-		return fmt.Errorf("expected disconnected peer to be BOOTSTRAP or KNOWN, got: %d", pType)
-	}
+	return outboundConns, reads, writes
+}
 
-	return fmt.Errorf("unable to find %v peer %s in CONNECTED list", pType, peer.ID.Pretty())
+func (pt *PeerTracker) GetTotalSeen() int {
+	pt.mu.Lock()
+	defer pt.mu.Unlock()
+
+	return len(pt.allSeen)
+}
+
+func (pt *PeerTracker) GetNumMessages() (uint64, uint64) {
+	numWrites := atomic.LoadUint64(&pt.stats.messagesSent)
+	numReads := atomic.LoadUint64(&pt.stats.messagesRead)
+	return numWrites, numReads
 }

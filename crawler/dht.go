@@ -46,7 +46,7 @@ func NewDHT() (*DHT, error) {
 	}
 
 	peerTracker := NewPeerTracker(host)
-	err = peerTracker.AddSelf(host.ID(), host.Addrs(), host.Mux().Protocols())
+	err = peerTracker.AddSelf(host.ID())
 	if err != nil {
 		return nil, fmt.Errorf("error adding self to peertracker: %v", err)
 	}
@@ -105,16 +105,26 @@ func createHost() (peerstore.Peerstore, host.Host, error) {
 func (dht *DHT) Start(ctx context.Context) error {
 
 	fmt.Printf("Starting DHT...\n")
+	fmt.Printf("Listening on addrs: %v\n", dht.host.Addrs())
+	fmt.Printf("Using protocols: %v\n", dht.host.Mux().Protocols())
 
 	ctx, cancel := context.WithCancel(ctx)
 
-	// Add bootstrap peers to PeerTracker
+	bootstrapSuccess := false
+	// Connect to bootstrap peers
 	for _, addr := range kadDHT.GetDefaultBootstrapPeerAddrInfos() {
-		err := dht.tracker.AddBootstrap(addr.ID, addr.Addrs)
-		if err != nil {
-			cancel()
-			return fmt.Errorf("error adding bootstrap peer: %v", err)
+		err := dht.tracker.BootstrapFrom(addr)
+		if err == nil {
+			fmt.Printf("Connected to bootstrap peer: %s @ %v\n", addr.ID.Pretty(), addr.Addrs)
+			bootstrapSuccess = true
+		} else {
+			fmt.Printf("Error connecting to bootstrap peer: %v\n", err)
 		}
+	}
+
+	if !bootstrapSuccess {
+		cancel()
+		return fmt.Errorf("Could not connect to any bootstrap peers; shutting down")
 	}
 
 	// Start crawler main loop
@@ -151,25 +161,15 @@ func (dht *DHT) connManager(ctx context.Context) {
 		default:
 			totalDHTStreams := dht.tracker.NumActiveStreams()
 
-			// dht.metrics.LogStats(totalDHTStreams, dht.peers.GetStats())
-
 			// If we have enough streams already, wait for a bit before continuing
 			if totalDHTStreams >= MAX_ACTIVE_CONNS {
 				time.Sleep(100 * time.Millisecond)
 				continue
 			}
 
-			// Otherwise, attempt to connect to peers until we either have
-			// none left to connect to, or we have exceeded MAX_ACTIVE_CONNS
-			for totalDHTStreams < MAX_ACTIVE_CONNS && dht.tracker.HasWork() {
-
-				err := dht.tracker.StartWorker(ctx)
-				if err != nil {
-					fmt.Printf("error starting work in tracker: %v\n", err)
-					break
-				}
-
-				totalDHTStreams++
+			// If we have peers available to connect to, try to do that
+			if peer := dht.tracker.PopConnectable(); peer != nil {
+				go dht.tracker.StartWorker(ctx, peer)
 			}
 		}
 	}
@@ -199,12 +199,13 @@ func (dht *DHT) PrintStats() {
 	strs = append(strs, fmt.Sprintf("Unique peers discovered: %d", totalSeen))
 
 	// Activity
-	streams, reads, writes := dht.tracker.GetActivity()
-	strs = append(strs, fmt.Sprintf("Current active streams: %d", streams))
+	outboundConns, reads, writes := dht.tracker.GetActivity()
+	strs = append(strs, fmt.Sprintf("Current # streams: %d", dht.tracker.NumActiveStreams()))
+	strs = append(strs, fmt.Sprintf("Current # outbound connections: %d", outboundConns))
 	strs = append(strs, fmt.Sprintf("Current active writes: %d", reads))
 	strs = append(strs, fmt.Sprintf("Current active reads: %d", writes))
 
-	numWrites, numReads := dht.tracker.GetReadsWrites()
+	numWrites, numReads := dht.tracker.GetNumMessages()
 	strs = append(strs, fmt.Sprintf("Messages written: %d", numWrites))
 	strs = append(strs, fmt.Sprintf("Messages read: %d", numReads))
 

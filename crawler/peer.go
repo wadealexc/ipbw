@@ -36,15 +36,14 @@ type PeerInfo struct {
 	totalMsgTypeReads map[MessageType]uint64
 }
 
-func NewPeer(id peer.ID, addrs []multiaddr.Multiaddr, protocols []string) (*Peer, error) {
-	if len(addrs) == 0 {
-		return nil, fmt.Errorf("expected nonempty addrs for peer: %v", id.Pretty())
+func NewPeer(addr peer.AddrInfo) (*Peer, error) {
+	if len(addr.Addrs) == 0 {
+		return nil, fmt.Errorf("expected nonempty addrs for peer: %v", addr.ID.Pretty())
 	}
 
 	return &Peer{
-		ID:        id,
-		Addrs:     addrs,
-		Protocols: protocols,
+		ID:    addr.ID,
+		Addrs: addr.Addrs,
 		Info: &PeerInfo{
 			readErrors:          make([]string, 0),
 			writeErrors:         make([]string, 0),
@@ -143,10 +142,6 @@ func (p *Peer) PrintErrors() {
 	strs := []string{}
 
 	strs = append(strs, fmt.Sprintf("Disconnecting from peer %s", p.ID.Pretty()))
-
-	if len(p.Info.readErrors) != 0 || len(p.Info.writeErrors) != 0 {
-		strs = append(strs, fmt.Sprintf("Printing errors:"))
-	}
 
 	if len(p.Info.readErrors) != 0 {
 		strs = append(strs, fmt.Sprintf("Read errors:"))
