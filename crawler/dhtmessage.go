@@ -5,6 +5,7 @@ import (
 
 	"github.com/libp2p/go-libp2p-core/peer"
 	pb "github.com/libp2p/go-libp2p-kad-dht/pb"
+	pbR "github.com/libp2p/go-libp2p-record/pb"
 	"github.com/multiformats/go-multiaddr"
 )
 
@@ -36,6 +37,47 @@ const (
 	PING
 )
 
+func NewPingMsg() *DHTMessage {
+	return &DHTMessage{
+		Type: PING,
+		Key:  "",
+	}
+}
+
+func NewFindNodeMsg(key []byte) *DHTMessage {
+	return &DHTMessage{
+		Type: FIND_NODE,
+		Key:  string(key),
+	}
+}
+
+func (msg *DHTMessage) Marshal() ([]byte, error) {
+
+	pbMsg := &pb.Message{
+		Type:            pb.Message_MessageType(msg.Type),
+		ClusterLevelRaw: msg.ClusterLevel,
+		Key:             []byte(msg.Key),
+		// TODO figure out how to send peers (unexported type in pb.Message_Peer)
+		CloserPeers:   make([]pb.Message_Peer, 0),
+		ProviderPeers: make([]pb.Message_Peer, 0),
+	}
+
+	if msg.Record != nil {
+		pbMsg.Record = &pbR.Record{
+			Key:          []byte(msg.Record.Key),
+			Value:        msg.Record.Value,
+			TimeReceived: msg.Record.TimeReceived,
+		}
+	}
+
+	res, err := pbMsg.Marshal()
+	if err != nil {
+		return nil, fmt.Errorf("error marshalling message: %v", err)
+	}
+
+	return res, nil
+}
+
 func NewDHTMsg(msgRaw []byte) (*DHTMessage, error) {
 	var msg pb.Message
 	err := msg.Unmarshal(msgRaw)
@@ -53,18 +95,23 @@ func NewDHTMsg(msgRaw []byte) (*DHTMessage, error) {
 		return nil, fmt.Errorf("error converting ProviderPeers to AddrInfo: %v", err)
 	}
 
-	return &DHTMessage{
-		Type:         MessageType(msg.GetType()),
-		ClusterLevel: msg.ClusterLevelRaw,
-		Key:          string(msg.GetKey()),
-		Record: &DHTRecord{
+	dhtMsg := &DHTMessage{
+		Type:          MessageType(msg.GetType()),
+		ClusterLevel:  msg.ClusterLevelRaw,
+		Key:           string(msg.GetKey()),
+		CloserPeers:   closerPeers,
+		ProviderPeers: providerPeers,
+	}
+
+	if msg.Record != nil {
+		dhtMsg.Record = &DHTRecord{
 			Key:          string(msg.Record.Key),
 			Value:        msg.Record.Value,
 			TimeReceived: msg.Record.TimeReceived,
-		},
-		CloserPeers:   closerPeers,
-		ProviderPeers: providerPeers,
-	}, nil
+		}
+	}
+
+	return dhtMsg, nil
 }
 
 func toAddrInfos(msgPeers []pb.Message_Peer) ([]peer.AddrInfo, error) {

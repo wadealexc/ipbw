@@ -2,20 +2,19 @@ package crawler
 
 import (
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 
-	"github.com/libp2p/go-libp2p-core/network"
 	"github.com/libp2p/go-libp2p-core/peer"
 	"github.com/multiformats/go-multiaddr"
 )
 
 type Peer struct {
-	ID    peer.ID
-	Addrs []multiaddr.Multiaddr
-	Info  *PeerInfo
-
-	stream network.Stream
+	ID        peer.ID
+	Addrs     []multiaddr.Multiaddr
+	Protocols []string
+	Info      *PeerInfo
 }
 
 type PeerInfo struct {
@@ -37,14 +36,15 @@ type PeerInfo struct {
 	totalMsgTypeReads map[MessageType]uint64
 }
 
-func NewPeer(id peer.ID, addrs []multiaddr.Multiaddr) (*Peer, error) {
+func NewPeer(id peer.ID, addrs []multiaddr.Multiaddr, protocols []string) (*Peer, error) {
 	if len(addrs) == 0 {
 		return nil, fmt.Errorf("expected nonempty addrs for peer: %v", id.Pretty())
 	}
 
 	return &Peer{
-		ID:    id,
-		Addrs: addrs,
+		ID:        id,
+		Addrs:     addrs,
+		Protocols: protocols,
 		Info: &PeerInfo{
 			readErrors:          make([]string, 0),
 			writeErrors:         make([]string, 0),
@@ -54,17 +54,13 @@ func NewPeer(id peer.ID, addrs []multiaddr.Multiaddr) (*Peer, error) {
 	}, nil
 }
 
-func (p *Peer) SetStream(stream network.Stream) error {
-	if p.stream != nil {
-		return fmt.Errorf("already have an open stream with peer: %v", p.ID.Pretty())
+func (p *Peer) SetProtocols(protos []string) error {
+	if len(p.Protocols) != 0 {
+		return fmt.Errorf("tried to set protocols twice for peer")
 	}
 
-	p.stream = stream
+	p.Protocols = protos
 	return nil
-}
-
-func (p *Peer) GetStream() network.Stream {
-	return p.stream
 }
 
 func (p *Peer) LogRead(size int) {
@@ -72,20 +68,20 @@ func (p *Peer) LogRead(size int) {
 	atomic.AddUint64(&p.Info.totalMessagesRead, uint64(1))
 }
 
-func (p *Peer) LogGetValue(namespace string, path string) {
+func (p *Peer) LogGetValue() {
 	p.Info.readMu.Lock()
 	defer p.Info.readMu.Unlock()
 
 	p.Info.totalMsgTypeReads[GET_VALUE]++
-	p.Info.totalNamespaceReads[namespace]++
+	// p.Info.totalNamespaceReads[namespace]++
 }
 
-func (p *Peer) LogPutValue(namespace string, path string, record *DHTRecord) {
+func (p *Peer) LogPutValue() {
 	p.Info.readMu.Lock()
 	defer p.Info.readMu.Unlock()
 
 	p.Info.totalMsgTypeReads[PUT_VALUE]++
-	p.Info.totalNamespaceReads[namespace]++
+	// p.Info.totalNamespaceReads[namespace]++
 }
 
 func (p *Peer) LogAddProvider() {
@@ -138,4 +134,34 @@ func (p *Peer) LogWriteError(format string, a ...interface{}) int {
 	p.Info.writeErrors = append(p.Info.writeErrors, str)
 
 	return len(p.Info.writeErrors)
+}
+
+func (p *Peer) PrintErrors() {
+	p.Info.errMu.Lock()
+	defer p.Info.errMu.Unlock()
+
+	strs := []string{}
+
+	strs = append(strs, fmt.Sprintf("Disconnecting from peer %s", p.ID.Pretty()))
+
+	if len(p.Info.readErrors) != 0 || len(p.Info.writeErrors) != 0 {
+		strs = append(strs, fmt.Sprintf("Printing errors:"))
+	}
+
+	if len(p.Info.readErrors) != 0 {
+		strs = append(strs, fmt.Sprintf("Read errors:"))
+		for _, err := range p.Info.readErrors {
+			strs = append(strs, err)
+		}
+	}
+
+	if len(p.Info.writeErrors) != 0 {
+		strs = append(strs, fmt.Sprintf("Write errors:"))
+		for _, err := range p.Info.writeErrors {
+			strs = append(strs, err)
+		}
+	}
+
+	output := strings.Join(strs, "\n")
+	fmt.Println(output)
 }
