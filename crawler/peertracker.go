@@ -16,9 +16,6 @@ import (
 
 // PeerTracker keeps track of all the peers we've heard about
 // as well as each peer's connection status
-// This is a dumb struct that knows little of the outside world.
-// It relies on the DHT to feed it accurate info.
-// Please do not lie to the PeerTracker.
 type PeerTracker struct {
 	mu sync.Mutex
 
@@ -37,10 +34,14 @@ type PeerTracker struct {
 
 	started   bool
 	startTime time.Time
+
+	errLog *FileLogger
+	dcLog  *FileLogger
 }
 
 type TrackerStats struct {
-	numConnected int64
+	numOutgoing  int64
+	numIncoming  int64
 	activeReads  int64
 	activeWrites int64
 
@@ -77,7 +78,19 @@ const (
 	KNOWN
 )
 
-func NewPeerTracker(host host.Host) *PeerTracker {
+type DisconnectFunc func(context.Context, context.CancelFunc, network.Stream, *Peer)
+
+func NewPeerTracker(host host.Host) (*PeerTracker, error) {
+	errLogger, err := NewFileLogger("errors")
+	if err != nil {
+		return nil, fmt.Errorf("error creating file logger: %v", err)
+	}
+
+	dcLog, err := NewFileLogger("disconnects")
+	if err != nil {
+		return nil, fmt.Errorf("error creating file logger: %v", err)
+	}
+
 	return &PeerTracker{
 		host:           host,
 		self:           make(map[peer.ID]struct{}),
@@ -86,7 +99,9 @@ func NewPeerTracker(host host.Host) *PeerTracker {
 		stats: &TrackerStats{
 			supportedProtocols: make(map[string]uint64),
 		},
-	}
+		errLog: errLogger,
+		dcLog:  dcLog,
+	}, nil
 }
 
 // Add our peer ID / addresses / protocols, so we don't accidentally
@@ -110,7 +125,7 @@ func (pt *PeerTracker) AddPeers(peers []peer.AddrInfo) (newCount int) {
 
 	for _, peer := range peers {
 		if _, isSelf := pt.self[peer.ID]; isSelf {
-			fmt.Printf("Attempted to add self to tracker!\n")
+			pt.errLog.Write("Attempted to add self to tracker!\n")
 			continue // skip
 		}
 
@@ -122,7 +137,7 @@ func (pt *PeerTracker) AddPeers(peers []peer.AddrInfo) (newCount int) {
 			// Add peer as connectable
 			connPeer, err := NewPeer(peer)
 			if err != nil {
-				fmt.Printf("Error creating peer: %v\n", err)
+				pt.errLog.Writef("Error creating peer: %v\n", err)
 				continue // skip
 			}
 
@@ -131,6 +146,42 @@ func (pt *PeerTracker) AddPeers(peers []peer.AddrInfo) (newCount int) {
 	}
 
 	return newCount
+}
+
+func (pt *PeerTracker) AddIncoming(addr peer.AddrInfo) (*Peer, error) {
+	pt.mu.Lock()
+	defer pt.mu.Unlock()
+
+	// Make sure peer is not self
+	if _, isSelf := pt.self[addr.ID]; isSelf {
+		return nil, fmt.Errorf("attempted to add self as incoming connection")
+	}
+
+	// Create peer from addrs
+	connPeer, err := NewPeer(addr)
+	if err != nil {
+		return nil, fmt.Errorf("error creating new peer: %v", err)
+	}
+
+	// We haven't seen this peer yet
+	if _, seen := pt.allSeen[addr.ID]; !seen {
+		// Mark seen
+		pt.allSeen[addr.ID] = struct{}{}
+
+		// If peer has not been seen yet, they shouldn't be in connectable
+		if _, exists := pt.allConnectable[addr.ID]; exists {
+			return nil, fmt.Errorf("peer %s not seen, but already in allConnectable", addr.ID)
+		}
+	} else {
+		// We have seen this peer before. If it's in allConnectable,
+		// good - we can delete it and return the peer to start work
+		if peer, exists := pt.allConnectable[addr.ID]; exists {
+			delete(pt.allConnectable, addr.ID)
+			return peer, nil
+		}
+	}
+
+	return connPeer, nil
 }
 
 // Attempts to connect to a bootstrap peer, returning an error if unsuccessful
@@ -177,11 +228,24 @@ func (pt *PeerTracker) PopConnectable() *Peer {
 	return peer
 }
 
+func (pt *PeerTracker) Stop() error {
+	err := pt.errLog.Close()
+	if err != nil {
+		return fmt.Errorf("error stopping errLog: %v", err)
+	}
+	err = pt.dcLog.Close()
+	if err != nil {
+		return fmt.Errorf("error stopping dcLog: %v", err)
+	}
+
+	return nil
+}
+
 func (pt *PeerTracker) StartWorker(ctx context.Context, peer *Peer) {
 	err := pt.tryConnect(ctx, peer)
 
 	if err != nil {
-		fmt.Printf("Error connecting to peer %s: %v\n", peer.ID.Pretty(), err)
+		pt.errLog.Writef("Error connecting to peer %s: %v\n", peer.ID.Pretty(), err)
 	}
 }
 
@@ -198,27 +262,53 @@ func (pt *PeerTracker) tryConnect(ctx context.Context, peer *Peer) error {
 		return err
 	}
 
-	atomic.AddInt64(&pt.stats.numConnected, 1)
+	atomic.AddInt64(&pt.stats.numOutgoing, 1)
 
 	// Start workers to read/write for peer
 	ctx, cancel = context.WithCancel(ctx)
 
 	go pt.doWrites(ctx, cancel, s, peer)
-	go pt.doReads(ctx, cancel, s, peer)
+	go pt.doReads(ctx, cancel, s, peer, pt.disconnectOut)
 
 	return nil
 }
 
-func (pt *PeerTracker) disconnect(ctx context.Context, cancel context.CancelFunc, s network.Stream, peer *Peer) {
+func (pt *PeerTracker) disconnectOut(ctx context.Context, cancel context.CancelFunc, s network.Stream, peer *Peer) {
 	// Close stream for reads and writes
 	err := s.Reset()
 	if err != nil {
-		fmt.Printf("Error trying to reset stream for peer %s: %v", peer.ID.Pretty(), err)
+		pt.errLog.Writef("Error trying to reset stream for peer %s: %v\n", peer.ID.Pretty(), err)
 	}
 
-	atomic.AddInt64(&pt.stats.numConnected, -1)
+	atomic.AddInt64(&pt.stats.numOutgoing, -1)
 
-	peer.PrintErrors()
+	errs := peer.GetErrors()
+	if len(errs) == 0 {
+		pt.dcLog.Writef("disconnectOut peer %s", peer.ID.Pretty())
+	} else {
+		pt.dcLog.Writef("disconnectOut peer %s; errors:\n%s", peer.ID.Pretty(), errs)
+	}
+
+	// Cancel context, which should halt reads / writes
+	cancel()
+}
+
+func (pt *PeerTracker) disconnectInc(ctx context.Context, cancel context.CancelFunc, s network.Stream, peer *Peer) {
+	// Close stream for reads and writes
+	err := s.Reset()
+	if err != nil {
+		pt.errLog.Writef("Error trying to reset stream for peer %s: %v\n", peer.ID.Pretty(), err)
+	}
+
+	atomic.AddInt64(&pt.stats.numIncoming, -1)
+
+	errs := peer.GetErrors()
+	if len(errs) == 0 {
+		pt.dcLog.Writef("disconnectInc peer %s", peer.ID.Pretty())
+	} else {
+		pt.dcLog.Writef("disconnectInc peer %s; errors:\n%s", peer.ID.Pretty(), errs)
+	}
+
 	// Cancel context, which should halt reads / writes
 	cancel()
 }
@@ -280,7 +370,7 @@ func (pt *PeerTracker) doWrites(ctx context.Context, cancel context.CancelFunc, 
 	}
 }
 
-func (pt *PeerTracker) doReads(ctx context.Context, cancel context.CancelFunc, s network.Stream, peer *Peer) {
+func (pt *PeerTracker) doReads(ctx context.Context, cancel context.CancelFunc, s network.Stream, peer *Peer, dcFunc DisconnectFunc) {
 
 	atomic.AddInt64(&pt.stats.activeReads, 1)
 	defer atomic.AddInt64(&pt.stats.activeReads, -1)
@@ -302,8 +392,8 @@ func (pt *PeerTracker) doReads(ctx context.Context, cancel context.CancelFunc, s
 			if err == nil {
 				err = peer.SetProtocols(protos)
 				if err != nil {
-					fmt.Printf("error setting protocols for peer; disconnecting: %v", err)
-					pt.disconnect(ctx, cancel, s, peer)
+					pt.errLog.Writef("error setting protocols for peer; disconnecting: %v\n", err)
+					dcFunc(ctx, cancel, s, peer)
 					continue
 				}
 
@@ -330,7 +420,7 @@ func (pt *PeerTracker) doReads(ctx context.Context, cancel context.CancelFunc, s
 			reader.ReleaseMsg(msgRaw)
 			peer.LogReadError("ReadMsg errored with: %v", err)
 
-			pt.disconnect(ctx, cancel, s, peer)
+			dcFunc(ctx, cancel, s, peer)
 			return
 		} else if msgRaw == nil {
 			continue
@@ -342,7 +432,7 @@ func (pt *PeerTracker) doReads(ctx context.Context, cancel context.CancelFunc, s
 		if err != nil {
 			errCount := peer.LogReadError("NewDHTMsg errored with: %v", err)
 			if errCount > MAX_READ_ERRORS {
-				pt.disconnect(ctx, cancel, s, peer)
+				dcFunc(ctx, cancel, s, peer)
 				return
 			}
 			continue
@@ -363,22 +453,7 @@ func (pt *PeerTracker) doReads(ctx context.Context, cancel context.CancelFunc, s
 		// First, check to see if the peer told us about new peers / providers:
 		// TODO do things with the returned values
 		pt.AddPeers(dhtMsg.CloserPeers)
-		// if err != nil {
-		// 	errCount := peer.LogReadError("AddReferred(Closer) errored with: %v", err)
-		// 	if errCount > MAX_READ_ERRORS {
-		// 		pt.disconnect(ctx, cancel, s, peer)
-		// 	}
-		// 	continue
-		// }
-
 		pt.AddPeers(dhtMsg.ProviderPeers)
-		// if err != nil {
-		// 	errCount := peer.LogReadError("AddReferred(Provider) errored with: %v", err)
-		// 	if errCount > MAX_READ_ERRORS {
-		// 		pt.disconnect(ctx, cancel, s, peer)
-		// 	}
-		// 	continue
-		// }
 
 		// TODO: perform more validation on reads - ex, IPNS sig validation / PK validation
 
@@ -396,7 +471,7 @@ func (pt *PeerTracker) doReads(ctx context.Context, cancel context.CancelFunc, s
 			if dhtMsg.Key != dhtMsg.Record.Key {
 				errCount := peer.LogReadError("PUT_VALUE: key mismatch. Expected %s == %s", dhtMsg.Key, dhtMsg.Record.Key)
 				if errCount > MAX_READ_ERRORS {
-					pt.disconnect(ctx, cancel, s, peer)
+					dcFunc(ctx, cancel, s, peer)
 					return
 				}
 				continue
@@ -441,7 +516,7 @@ func (pt *PeerTracker) doReads(ctx context.Context, cancel context.CancelFunc, s
 		default:
 			errCount := peer.LogReadError("invalid message type: %d", dhtMsg.Type)
 			if errCount > MAX_READ_ERRORS {
-				pt.disconnect(ctx, cancel, s, peer)
+				dcFunc(ctx, cancel, s, peer)
 				return
 			}
 			continue
@@ -474,12 +549,13 @@ func (pt *PeerTracker) GetTimeElapsed() time.Duration {
 	return time.Since(pt.startTime)
 }
 
-func (pt *PeerTracker) GetActivity() (int64, int64, int64) {
-	outboundConns := atomic.LoadInt64(&pt.stats.numConnected)
+func (pt *PeerTracker) GetActivity() (int64, int64, int64, int64) {
+	outboundConns := atomic.LoadInt64(&pt.stats.numOutgoing)
+	incomingConns := atomic.LoadInt64(&pt.stats.numIncoming)
 	reads := atomic.LoadInt64(&pt.stats.activeReads)
 	writes := atomic.LoadInt64(&pt.stats.activeWrites)
 
-	return outboundConns, reads, writes
+	return outboundConns, incomingConns, reads, writes
 }
 
 func (pt *PeerTracker) GetTotalSeen() int {
@@ -489,8 +565,20 @@ func (pt *PeerTracker) GetTotalSeen() int {
 	return len(pt.allSeen)
 }
 
-func (pt *PeerTracker) GetNumMessages() (uint64, uint64) {
+func (pt *PeerTracker) GetNumWrites() (uint64, uint64, uint64) {
 	numWrites := atomic.LoadUint64(&pt.stats.messagesSent)
+	sentFindNode := atomic.LoadUint64(&pt.stats.sentFindNode)
+	sentPing := atomic.LoadUint64(&pt.stats.sentPing)
+	return numWrites, sentFindNode, sentPing
+}
+
+func (pt *PeerTracker) GetNumReads() (uint64, uint64, uint64, uint64, uint64, uint64, uint64) {
 	numReads := atomic.LoadUint64(&pt.stats.messagesRead)
-	return numWrites, numReads
+	readPutValue := atomic.LoadUint64(&pt.stats.readPutValue)
+	readGetValue := atomic.LoadUint64(&pt.stats.readGetValue)
+	readAddProvider := atomic.LoadUint64(&pt.stats.readAddProvider)
+	readGetProviders := atomic.LoadUint64(&pt.stats.readGetProviders)
+	readFindNode := atomic.LoadUint64(&pt.stats.readFindNode)
+	readPing := atomic.LoadUint64(&pt.stats.readPing)
+	return numReads, readPutValue, readGetValue, readAddProvider, readGetProviders, readFindNode, readPing
 }

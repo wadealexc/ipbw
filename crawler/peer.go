@@ -135,13 +135,11 @@ func (p *Peer) LogWriteError(format string, a ...interface{}) int {
 	return len(p.Info.writeErrors)
 }
 
-func (p *Peer) PrintErrors() {
+func (p *Peer) GetErrors() string {
 	p.Info.errMu.Lock()
 	defer p.Info.errMu.Unlock()
 
 	strs := []string{}
-
-	strs = append(strs, fmt.Sprintf("Disconnecting from peer %s", p.ID.Pretty()))
 
 	if len(p.Info.readErrors) != 0 {
 		strs = append(strs, fmt.Sprintf("Read errors:"))
@@ -157,6 +155,9 @@ func (p *Peer) PrintErrors() {
 		}
 	}
 
-	output := strings.Join(strs, "\n")
-	fmt.Println(output)
+	if len(strs) == 0 {
+		return ""
+	}
+
+	return strings.Join(strs, "\n")
 }

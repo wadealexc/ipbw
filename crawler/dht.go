@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -13,6 +14,7 @@ import (
 	"github.com/libp2p/go-libp2p-core/crypto"
 	"github.com/libp2p/go-libp2p-core/host"
 	"github.com/libp2p/go-libp2p-core/network"
+	"github.com/libp2p/go-libp2p-core/peer"
 	"github.com/libp2p/go-libp2p-core/peerstore"
 	kadDHT "github.com/libp2p/go-libp2p-kad-dht"
 	"github.com/libp2p/go-libp2p-peerstore/pstoremem"
@@ -45,7 +47,11 @@ func NewDHT() (*DHT, error) {
 		return nil, fmt.Errorf("error in createHost: %v", err)
 	}
 
-	peerTracker := NewPeerTracker(host)
+	peerTracker, err := NewPeerTracker(host)
+	if err != nil {
+		return nil, fmt.Errorf("error creating PeerTracker: %v", err)
+	}
+
 	err = peerTracker.AddSelf(host.ID())
 	if err != nil {
 		return nil, fmt.Errorf("error adding self to peertracker: %v", err)
@@ -86,13 +92,6 @@ func createHost() (peerstore.Peerstore, host.Host, error) {
 		context.Background(),
 		libp2p.Identity(pk),
 		libp2p.Peerstore(peerstore),
-		// libp2p.ListenAddrStrings(
-		// 	fmt.Sprintf("/ip4/0.0.0.0/tcp/%d", PORT),      // regular tcp connections
-		// 	fmt.Sprintf("/ip6/::/tcp/%d", PORT),           // regular tcp connections
-		// 	fmt.Sprintf("/ip4/0.0.0.0/udp/%d/quic", PORT), // a UDP endpoint for the QUIC transport
-		// 	fmt.Sprintf("/ip6/::/udp/%d/quic", PORT),      // a UDP endpoint for the QUIC transport
-		// ),
-		// libp2p.Transport(libp2pquic.NewTransport),
 		libp2p.UserAgent(USER_AGENT),
 	)
 	if err != nil {
@@ -157,6 +156,10 @@ func (dht *DHT) connManager(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
+			err := dht.tracker.Stop()
+			if err != nil {
+				fmt.Printf("Error stopping tracker: %v", err)
+			}
 			return
 		default:
 			totalDHTStreams := dht.tracker.NumActiveStreams()
@@ -176,7 +179,29 @@ func (dht *DHT) connManager(ctx context.Context) {
 }
 
 func (dht *DHT) handleIncomingConn(s network.Stream) {
-	// TODO
+	// Get info on remote peer connecting to us
+	pid := s.Conn().RemotePeer()
+	addrs := dht.peerstore.Addrs(pid)
+
+	addrInfo := peer.AddrInfo{
+		ID:    pid,
+		Addrs: addrs,
+	}
+
+	// Add peer to tracker
+	peer, err := dht.tracker.AddIncoming(addrInfo)
+	if err != nil {
+		fmt.Printf("Error adding incoming peer: %v\n", err)
+		return
+	}
+
+	// Record incoming conn
+	atomic.AddInt64(&dht.tracker.stats.numIncoming, 1)
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	go dht.tracker.doWrites(ctx, cancel, s, peer)
+	go dht.tracker.doReads(ctx, cancel, s, peer, dht.tracker.disconnectInc)
 }
 
 func (dht *DHT) PrintStats() {
@@ -190,8 +215,8 @@ func (dht *DHT) PrintStats() {
 	// Duration
 	timeElapsed := dht.tracker.GetTimeElapsed()
 	hours := uint64(timeElapsed.Hours())
-	minutes := uint64(timeElapsed.Minutes())
-	seconds := uint64(timeElapsed.Seconds())
+	minutes := uint64(timeElapsed.Minutes()) % 60
+	seconds := uint64(timeElapsed.Seconds()) % 60
 	strs = append(strs, fmt.Sprintf("Time elapsed: %d hr | %d min | %d sec", hours, minutes, seconds)) // TODO
 
 	// Basic info
@@ -199,31 +224,28 @@ func (dht *DHT) PrintStats() {
 	strs = append(strs, fmt.Sprintf("Unique peers discovered: %d", totalSeen))
 
 	// Activity
-	outboundConns, reads, writes := dht.tracker.GetActivity()
+	outboundConns, incomingConns, reads, writes := dht.tracker.GetActivity()
 	strs = append(strs, fmt.Sprintf("Current # streams: %d", dht.tracker.NumActiveStreams()))
 	strs = append(strs, fmt.Sprintf("Current # outbound connections: %d", outboundConns))
+	strs = append(strs, fmt.Sprintf("Current # incoming connections: %d", incomingConns))
 	strs = append(strs, fmt.Sprintf("Current active writes: %d", reads))
 	strs = append(strs, fmt.Sprintf("Current active reads: %d", writes))
 
-	numWrites, numReads := dht.tracker.GetNumMessages()
-	strs = append(strs, fmt.Sprintf("Messages written: %d", numWrites))
-	strs = append(strs, fmt.Sprintf("Messages read: %d", numReads))
+	numWrites, sentFindNode, sentPing := dht.tracker.GetNumWrites()
+	strs = append(strs, fmt.Sprintf("Messages written: %d; by type:", numWrites))
+	strs = append(strs, fmt.Sprintf("- FIND_NODE: %d", sentFindNode))
+	strs = append(strs, fmt.Sprintf("- PING: %d", sentPing))
 
-	// TODO - info about protocols
+	numReads, readPutValue, readGetValue, readAddProvider, readGetProviders, readFindNode, readPing := dht.tracker.GetNumReads()
+	strs = append(strs, fmt.Sprintf("Messages read: %d; by type:", numReads))
+	strs = append(strs, fmt.Sprintf("- PUT_VALUE: %d", readPutValue))
+	strs = append(strs, fmt.Sprintf("- GET_VALUE: %d", readGetValue))
+	strs = append(strs, fmt.Sprintf("- ADD_PROVIDER: %d", readAddProvider))
+	strs = append(strs, fmt.Sprintf("- GET_PROVIDERS: %d", readGetProviders))
+	strs = append(strs, fmt.Sprintf("- FIND_NODE: %d", readFindNode))
+	strs = append(strs, fmt.Sprintf("- PING: %d", readPing))
 
-	// // Worker activity
-	// strs = append(strs, fmt.Sprintf("%d peers currently connected", stats.totalConnected))
-	// strs = append(strs, fmt.Sprintf("%d streams using DHT protocol", stats.activeStreams))
-	// strs = append(strs, fmt.Sprintf("%d active writes with peers", stats.activeWrites))
-	// strs = append(strs, fmt.Sprintf("%d active reads with peers", stats.activeReads))
-	// // TODO - how much data has been read/written; how many messages sent/received?
-
-	// strs = append(strs, fmt.Sprintf("%d peers waiting to be connected to", stats.totalConnectable))
-	// strs = append(strs, fmt.Sprintf("%d peers disconnected", stats.totalDisconnected))
-	// strs = append(strs, fmt.Sprintf("%d peers found unreachable", stats.totalDisconnected))
-
-	// Errors
-	// TODO - DHT errors, any peer errors?
+	// TODO - info about protocols, user agents, more granular activity...
 
 	// Print stats, separated by newline
 	output := strings.Join(strs, "\n")
