@@ -143,16 +143,12 @@ func (p *Peer) GetErrors() string {
 
 	if len(p.Info.readErrors) != 0 {
 		strs = append(strs, fmt.Sprintf("Read errors:"))
-		for _, err := range p.Info.readErrors {
-			strs = append(strs, err)
-		}
+		strs = append(strs, p.Info.readErrors...)
 	}
 
 	if len(p.Info.writeErrors) != 0 {
 		strs = append(strs, fmt.Sprintf("Write errors:"))
-		for _, err := range p.Info.writeErrors {
-			strs = append(strs, err)
-		}
+		strs = append(strs, p.Info.writeErrors...)
 	}
 
 	if len(strs) == 0 {

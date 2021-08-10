@@ -23,10 +23,8 @@ type PeerTracker struct {
 
 	// Contains the peer IDs being used by the crawler
 	self map[peer.ID]struct{}
-
 	// All the unique peers we've seen
 	allSeen map[peer.ID]struct{}
-
 	// All the peers we have not attempted to connect to
 	allConnectable map[peer.ID]*Peer
 
@@ -40,6 +38,7 @@ type PeerTracker struct {
 }
 
 type TrackerStats struct {
+	numWorkers   int64
 	numOutgoing  int64
 	numIncoming  int64
 	activeReads  int64
@@ -262,6 +261,8 @@ func (pt *PeerTracker) tryConnect(ctx context.Context, peer *Peer) error {
 		return err
 	}
 
+	// Record outgoing conn
+	atomic.AddInt64(&pt.stats.numWorkers, 1)
 	atomic.AddInt64(&pt.stats.numOutgoing, 1)
 
 	// Start workers to read/write for peer
@@ -280,6 +281,7 @@ func (pt *PeerTracker) disconnectOut(ctx context.Context, cancel context.CancelF
 		pt.errLog.Writef("Error trying to reset stream for peer %s: %v\n", peer.ID.Pretty(), err)
 	}
 
+	atomic.AddInt64(&pt.stats.numWorkers, -1)
 	atomic.AddInt64(&pt.stats.numOutgoing, -1)
 
 	errs := peer.GetErrors()
@@ -300,6 +302,7 @@ func (pt *PeerTracker) disconnectInc(ctx context.Context, cancel context.CancelF
 		pt.errLog.Writef("Error trying to reset stream for peer %s: %v\n", peer.ID.Pretty(), err)
 	}
 
+	atomic.AddInt64(&pt.stats.numWorkers, -1)
 	atomic.AddInt64(&pt.stats.numIncoming, -1)
 
 	errs := peer.GetErrors()
@@ -548,13 +551,18 @@ func (pt *PeerTracker) GetTimeElapsed() time.Duration {
 	return time.Since(pt.startTime)
 }
 
-func (pt *PeerTracker) GetActivity() (int64, int64, int64, int64) {
+func (pt *PeerTracker) GetActivity() (int64, int64, int64, int64, int64) {
+	numWorkers := atomic.LoadInt64(&pt.stats.numWorkers)
 	outboundConns := atomic.LoadInt64(&pt.stats.numOutgoing)
 	incomingConns := atomic.LoadInt64(&pt.stats.numIncoming)
 	reads := atomic.LoadInt64(&pt.stats.activeReads)
 	writes := atomic.LoadInt64(&pt.stats.activeWrites)
 
-	return outboundConns, incomingConns, reads, writes
+	return numWorkers, outboundConns, incomingConns, reads, writes
+}
+
+func (pt *PeerTracker) GetNumWorkers() int64 {
+	return atomic.LoadInt64(&pt.stats.numWorkers)
 }
 
 func (pt *PeerTracker) GetTotalSeen() int {
@@ -562,6 +570,13 @@ func (pt *PeerTracker) GetTotalSeen() int {
 	defer pt.mu.Unlock()
 
 	return len(pt.allSeen)
+}
+
+func (pt *PeerTracker) GetNumConnectable() int {
+	pt.mu.Lock()
+	defer pt.mu.Unlock()
+
+	return len(pt.allConnectable)
 }
 
 func (pt *PeerTracker) GetNumWrites() (uint64, uint64, uint64) {

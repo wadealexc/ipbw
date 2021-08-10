@@ -27,8 +27,6 @@ type DHT struct {
 	// Tracks all the peers we've heard about, connected to,
 	// and failed to connect to
 	tracker *PeerTracker
-
-	// metrics *DHTMetrics
 }
 
 const PORT = 1337
@@ -161,10 +159,10 @@ func (dht *DHT) connManager(ctx context.Context) {
 			}
 			return
 		default:
-			totalDHTStreams := dht.tracker.NumActiveStreams()
+			totalWorkers := dht.tracker.GetNumWorkers()
 
 			// If we have enough streams already, wait for a bit before continuing
-			if totalDHTStreams >= MAX_ACTIVE_CONNS {
+			if totalWorkers >= MAX_ACTIVE_CONNS {
 				time.Sleep(100 * time.Millisecond)
 				continue
 			}
@@ -195,6 +193,7 @@ func (dht *DHT) handleIncomingConn(s network.Stream) {
 	}
 
 	// Record incoming conn
+	atomic.AddInt64(&dht.tracker.stats.numWorkers, 1)
 	atomic.AddInt64(&dht.tracker.stats.numIncoming, 1)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -222,9 +221,13 @@ func (dht *DHT) PrintStats() {
 	totalSeen := dht.tracker.GetTotalSeen()
 	strs = append(strs, fmt.Sprintf("Unique peers discovered: %d", totalSeen))
 
-	// Activity
-	outboundConns, incomingConns, reads, writes := dht.tracker.GetActivity()
 	strs = append(strs, fmt.Sprintf("Current # streams: %d", dht.tracker.NumActiveStreams()))
+
+	// Activity
+	numWorkers, outboundConns, incomingConns, reads, writes := dht.tracker.GetActivity()
+	peersRemaining := dht.tracker.GetNumConnectable()
+	strs = append(strs, fmt.Sprintf("Current # workers talking to peers: %d", numWorkers))
+	strs = append(strs, fmt.Sprintf("Current # peers waiting for connection: %d", peersRemaining))
 	strs = append(strs, fmt.Sprintf("Current # outbound connections: %d", outboundConns))
 	strs = append(strs, fmt.Sprintf("Current # incoming connections: %d", incomingConns))
 	strs = append(strs, fmt.Sprintf("Current active writes: %d", reads))
