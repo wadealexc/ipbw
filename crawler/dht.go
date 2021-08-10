@@ -61,7 +61,6 @@ func NewDHT() (*DHT, error) {
 		peerstore: peerstore,
 		host:      host,
 		tracker:   peerTracker,
-		// metrics:   NewDHTMetrics(), // TODO
 	}
 
 	// kad := kadDHT.NewDHTClient(nil, nil, nil)

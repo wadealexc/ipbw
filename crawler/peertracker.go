@@ -125,7 +125,7 @@ func (pt *PeerTracker) AddPeers(peers []peer.AddrInfo) (newCount int) {
 
 	for _, peer := range peers {
 		if _, isSelf := pt.self[peer.ID]; isSelf {
-			pt.errLog.Write("Attempted to add self to tracker!\n")
+			fmt.Printf("Attempted to add self to tracker!\n")
 			continue // skip
 		}
 
@@ -534,7 +534,6 @@ func (pt *PeerTracker) NumActiveStreams() int {
 		for _, stream := range conn.GetStreams() {
 			if stream.Protocol() == DHT_PROTO {
 				activeStreams++
-				break
 			}
 		}
 	}
