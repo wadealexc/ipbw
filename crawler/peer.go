@@ -18,9 +18,11 @@ type Peer struct {
 }
 
 type PeerInfo struct {
-	errMu       sync.Mutex
-	readErrors  []string
-	writeErrors []string
+	errMu            sync.Mutex
+	totalReadErrors  uint64
+	readErrors       map[string]uint64
+	totalWriteErrors uint64
+	writeErrors      map[string]uint64
 
 	//// INFO FOR READS
 	// General read stats:
@@ -45,8 +47,8 @@ func NewPeer(addr peer.AddrInfo) (*Peer, error) {
 		ID:    addr.ID,
 		Addrs: addr.Addrs,
 		Info: &PeerInfo{
-			readErrors:          make([]string, 0),
-			writeErrors:         make([]string, 0),
+			readErrors:          make(map[string]uint64),
+			writeErrors:         make(map[string]uint64),
 			totalNamespaceReads: make(map[string]uint64),
 			totalMsgTypeReads:   make(map[MessageType]uint64),
 		},
@@ -115,24 +117,20 @@ func (p *Peer) LogPing() {
 	// p.Info.totalNamespaceReads[namespace]++
 }
 
-func (p *Peer) LogReadError(format string, a ...interface{}) int {
+func (p *Peer) LogReadError(err error) {
 	p.Info.errMu.Lock()
 	defer p.Info.errMu.Unlock()
 
-	str := fmt.Sprintf(format, a...)
-	p.Info.readErrors = append(p.Info.readErrors, str)
-
-	return len(p.Info.readErrors)
+	p.Info.totalReadErrors++
+	p.Info.readErrors[err.Error()]++
 }
 
-func (p *Peer) LogWriteError(format string, a ...interface{}) int {
+func (p *Peer) LogWriteError(err error) {
 	p.Info.errMu.Lock()
 	defer p.Info.errMu.Unlock()
 
-	str := fmt.Sprintf(format, a...)
-	p.Info.writeErrors = append(p.Info.writeErrors, str)
-
-	return len(p.Info.writeErrors)
+	p.Info.totalWriteErrors++
+	p.Info.writeErrors[err.Error()]++
 }
 
 func (p *Peer) GetErrors() string {
@@ -141,14 +139,18 @@ func (p *Peer) GetErrors() string {
 
 	strs := []string{}
 
-	if len(p.Info.readErrors) != 0 {
-		strs = append(strs, fmt.Sprintf("Read errors:"))
-		strs = append(strs, p.Info.readErrors...)
+	if p.Info.totalReadErrors != 0 {
+		strs = append(strs, fmt.Sprintf("Total read errors: %d", p.Info.totalReadErrors))
+		for err, amt := range p.Info.readErrors {
+			strs = append(strs, fmt.Sprintf("%s: %d", err, amt))
+		}
 	}
 
-	if len(p.Info.writeErrors) != 0 {
-		strs = append(strs, fmt.Sprintf("Write errors:"))
-		strs = append(strs, p.Info.writeErrors...)
+	if p.Info.totalWriteErrors != 0 {
+		strs = append(strs, fmt.Sprintf("Total write errors: %d", p.Info.totalWriteErrors))
+		for err, amt := range p.Info.writeErrors {
+			strs = append(strs, fmt.Sprintf("%s: %d", err, amt))
+		}
 	}
 
 	if len(strs) == 0 {

@@ -343,7 +343,7 @@ func (pt *PeerTracker) doWrites(ctx context.Context, cancel context.CancelFunc, 
 
 			err = writer.WriteMsg(data)
 			if err != nil {
-				peer.LogWriteError("Error writing PING; stopping writes: %v", err)
+				peer.LogWriteError(err)
 				return
 			}
 
@@ -362,7 +362,7 @@ func (pt *PeerTracker) doWrites(ctx context.Context, cancel context.CancelFunc, 
 
 			err = writer.WriteMsg(data)
 			if err != nil {
-				peer.LogWriteError("Error writing FIND_NODE; stopping writes: %v", err)
+				peer.LogWriteError(err)
 				return
 			}
 
@@ -396,8 +396,9 @@ func (pt *PeerTracker) doReads(ctx context.Context, cancel context.CancelFunc, s
 				err = peer.SetProtocols(protos)
 				if err != nil {
 					pt.errLog.Writef("error setting protocols for peer; disconnecting: %v\n", err)
+
 					dcFunc(ctx, cancel, s, peer)
-					continue
+					return
 				}
 
 				pt.stats.spMu.Lock()
@@ -421,7 +422,7 @@ func (pt *PeerTracker) doReads(ctx context.Context, cancel context.CancelFunc, s
 		msgRaw, err := reader.ReadMsg()
 		if err != nil {
 			reader.ReleaseMsg(msgRaw)
-			peer.LogReadError("ReadMsg errored with: %v", err)
+			peer.LogReadError(err)
 
 			dcFunc(ctx, cancel, s, peer)
 			return
@@ -433,12 +434,10 @@ func (pt *PeerTracker) doReads(ctx context.Context, cancel context.CancelFunc, s
 		dhtMsg, err := NewDHTMsg(msgRaw)
 		reader.ReleaseMsg(msgRaw) // release byte buffer in reader
 		if err != nil {
-			errCount := peer.LogReadError("NewDHTMsg errored with: %v", err)
-			if errCount > MAX_READ_ERRORS {
-				dcFunc(ctx, cancel, s, peer)
-				return
-			}
-			continue
+			pt.errLog.Writef("NewDHTMsg errored with %v from peer %s", err, peer.ID.Pretty())
+
+			dcFunc(ctx, cancel, s, peer)
+			return
 		}
 
 		// Get message key and split into namespace / path
@@ -446,10 +445,6 @@ func (pt *PeerTracker) doReads(ctx context.Context, cancel context.CancelFunc, s
 		// key := dhtMsg.Key
 		// namespace, path, err := record.SplitKey(key)
 		// if err != nil {
-		// 	errCount := peer.LogReadError("SplitKey errored with: %v for key %s", err, key)
-		// 	if errCount > MAX_READ_ERRORS {
-		// 		pt.disconnect(ctx, cancel, s, peer)
-		// 	}
 		// 	continue
 		// }
 
@@ -472,12 +467,10 @@ func (pt *PeerTracker) doReads(ctx context.Context, cancel context.CancelFunc, s
 			// For DHT implementation see:
 			// IpfsDHT.handlePutValue(nil, nil, nil)
 			if dhtMsg.Key != dhtMsg.Record.Key {
-				errCount := peer.LogReadError("PUT_VALUE: key mismatch. Expected %s == %s", dhtMsg.Key, dhtMsg.Record.Key)
-				if errCount > MAX_READ_ERRORS {
-					dcFunc(ctx, cancel, s, peer)
-					return
-				}
-				continue
+				pt.errLog.Writef("PUT_VALUE: key mismatch. Expected %s == %s", dhtMsg.Key, dhtMsg.Record.Key)
+
+				dcFunc(ctx, cancel, s, peer)
+				return
 			}
 
 			peer.LogPutValue()
@@ -517,12 +510,10 @@ func (pt *PeerTracker) doReads(ctx context.Context, cancel context.CancelFunc, s
 			peer.LogPing()
 			atomic.AddUint64(&pt.stats.readPing, 1)
 		default:
-			errCount := peer.LogReadError("invalid message type: %d", dhtMsg.Type)
-			if errCount > MAX_READ_ERRORS {
-				dcFunc(ctx, cancel, s, peer)
-				return
-			}
-			continue
+			pt.errLog.Writef("Invalid message type %d from peer %s", dhtMsg.Type, peer.ID.Pretty())
+
+			dcFunc(ctx, cancel, s, peer)
+			return
 		}
 
 		peer.LogRead(len(msgRaw))
