@@ -38,11 +38,14 @@ type PeerTracker struct {
 }
 
 type TrackerStats struct {
-	numWorkers   int64
-	numOutgoing  int64
-	numIncoming  int64
-	activeReads  int64
-	activeWrites int64
+	numWorkers           int64
+	numEstablishing      int64
+	numFailedToEstablish int64
+	numDisconnected      int64
+	numOutgoing          int64
+	numIncoming          int64
+	activeReads          int64
+	activeWrites         int64
 
 	messagesSent uint64
 	sentFindNode uint64
@@ -241,11 +244,20 @@ func (pt *PeerTracker) Stop() error {
 }
 
 func (pt *PeerTracker) StartWorker(ctx context.Context, peer *Peer) {
+	// Record spawned worker
+	atomic.AddInt64(&pt.stats.numWorkers, 1)
+	atomic.AddInt64(&pt.stats.numEstablishing, 1)
+
 	err := pt.tryConnect(ctx, peer)
 
+	// Unable to establish connection:
 	if err != nil {
+		atomic.AddInt64(&pt.stats.numWorkers, -1)
 		pt.errLog.Writef("Error connecting to peer %s: %v\n", peer.ID.Pretty(), err)
 	}
+
+	// We have either succeeded or failed at connecting, but we are no longer "establishing"
+	atomic.AddInt64(&pt.stats.numEstablishing, -1)
 }
 
 // Attempt to connect to a peer. Return true if we succeed
@@ -257,12 +269,12 @@ func (pt *PeerTracker) tryConnect(ctx context.Context, peer *Peer) error {
 	sCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	s, err := pt.host.NewStream(sCtx, peer.ID, DHT_PROTO)
 	if err != nil {
+		atomic.AddInt64(&pt.stats.numFailedToEstablish, 1)
 		cancel()
 		return err
 	}
 
 	// Record outgoing conn
-	atomic.AddInt64(&pt.stats.numWorkers, 1)
 	atomic.AddInt64(&pt.stats.numOutgoing, 1)
 
 	// Start workers to read/write for peer
@@ -283,6 +295,7 @@ func (pt *PeerTracker) disconnectOut(ctx context.Context, cancel context.CancelF
 
 	atomic.AddInt64(&pt.stats.numWorkers, -1)
 	atomic.AddInt64(&pt.stats.numOutgoing, -1)
+	atomic.AddInt64(&pt.stats.numDisconnected, 1)
 
 	errs := peer.GetErrors()
 	if len(errs) == 0 {
@@ -304,6 +317,7 @@ func (pt *PeerTracker) disconnectInc(ctx context.Context, cancel context.CancelF
 
 	atomic.AddInt64(&pt.stats.numWorkers, -1)
 	atomic.AddInt64(&pt.stats.numIncoming, -1)
+	atomic.AddInt64(&pt.stats.numDisconnected, 1)
 
 	errs := peer.GetErrors()
 	if len(errs) == 0 {
@@ -542,14 +556,17 @@ func (pt *PeerTracker) GetTimeElapsed() time.Duration {
 	return time.Since(pt.startTime)
 }
 
-func (pt *PeerTracker) GetActivity() (int64, int64, int64, int64, int64) {
+func (pt *PeerTracker) GetActivity() (int64, int64, int64, int64, int64, int64, int64, int64) {
 	numWorkers := atomic.LoadInt64(&pt.stats.numWorkers)
+	numEstablishing := atomic.LoadInt64(&pt.stats.numEstablishing)
+	numFailedToEstablish := atomic.LoadInt64(&pt.stats.numFailedToEstablish)
+	numDisconnected := atomic.LoadInt64(&pt.stats.numDisconnected)
 	outboundConns := atomic.LoadInt64(&pt.stats.numOutgoing)
 	incomingConns := atomic.LoadInt64(&pt.stats.numIncoming)
 	reads := atomic.LoadInt64(&pt.stats.activeReads)
 	writes := atomic.LoadInt64(&pt.stats.activeWrites)
 
-	return numWorkers, outboundConns, incomingConns, reads, writes
+	return numWorkers, numEstablishing, numFailedToEstablish, numDisconnected, outboundConns, incomingConns, reads, writes
 }
 
 func (pt *PeerTracker) GetNumWorkers() int64 {

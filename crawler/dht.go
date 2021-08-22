@@ -33,7 +33,8 @@ const PORT = 1337
 const USER_AGENT = "IPBW"
 
 const DHT_PROTO = "/ipfs/kad/1.0.0"
-const MAX_ACTIVE_CONNS = 1000
+
+const MAX_ACTIVE_WORKERS = 1500
 
 // Maximum number of errors reading a peer's messages before we
 // disconnect from them
@@ -161,8 +162,8 @@ func (dht *DHT) connManager(ctx context.Context) {
 		default:
 			totalWorkers := dht.tracker.GetNumWorkers()
 
-			// If we have enough streams already, wait for a bit before continuing
-			if totalWorkers >= MAX_ACTIVE_CONNS {
+			// If we have enough workers already, wait for a bit before continuing
+			if totalWorkers > MAX_ACTIVE_WORKERS {
 				time.Sleep(100 * time.Millisecond)
 				continue
 			}
@@ -176,6 +177,11 @@ func (dht *DHT) connManager(ctx context.Context) {
 }
 
 func (dht *DHT) handleIncomingConn(s network.Stream) {
+	// If we already have a lot of workers running, do nothing
+	if dht.tracker.GetNumWorkers() > MAX_ACTIVE_WORKERS {
+		return
+	}
+
 	// Get info on remote peer connecting to us
 	pid := s.Conn().RemotePeer()
 	addrs := dht.peerstore.Addrs(pid)
@@ -221,15 +227,15 @@ func (dht *DHT) PrintStats() {
 	totalSeen := dht.tracker.GetTotalSeen()
 	strs = append(strs, fmt.Sprintf("Unique peers discovered: %d", totalSeen))
 
-	strs = append(strs, fmt.Sprintf("Current # streams: %d", dht.tracker.NumActiveStreams()))
-
 	// Activity
-	numWorkers, outboundConns, incomingConns, reads, writes := dht.tracker.GetActivity()
+	numWorkers, numEstablishing, numFailedToEstablish, numDisconnected, outboundConns, incomingConns, reads, writes := dht.tracker.GetActivity()
 	peersRemaining := dht.tracker.GetNumConnectable()
-	strs = append(strs, fmt.Sprintf("Current # workers talking to peers: %d", numWorkers))
-	strs = append(strs, fmt.Sprintf("Current # peers waiting for connection: %d", peersRemaining))
-	strs = append(strs, fmt.Sprintf("Current # outbound connections: %d", outboundConns))
-	strs = append(strs, fmt.Sprintf("Current # incoming connections: %d", incomingConns))
+	strs = append(strs, fmt.Sprintf("# active DHT streams: %d", dht.tracker.NumActiveStreams()))
+	strs = append(strs, fmt.Sprintf("# workers on active connections: %d (%d outbound, %d incoming)", numWorkers, outboundConns, incomingConns))
+	strs = append(strs, fmt.Sprintf("# workers establishing connections: %d", numEstablishing))
+	strs = append(strs, fmt.Sprintf("# peers unreachable: %d", numFailedToEstablish))
+	strs = append(strs, fmt.Sprintf("# peers disconnected: %d", numDisconnected))
+	strs = append(strs, fmt.Sprintf("# peers not yet tried: %d", peersRemaining))
 	strs = append(strs, fmt.Sprintf("Current active writes: %d", reads))
 	strs = append(strs, fmt.Sprintf("Current active reads: %d", writes))
 
