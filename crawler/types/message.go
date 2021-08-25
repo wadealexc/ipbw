@@ -1,6 +1,7 @@
-package crawler
+package types
 
 import (
+	"crypto/rand"
 	"fmt"
 
 	"github.com/libp2p/go-libp2p-core/peer"
@@ -18,6 +19,8 @@ type DHTMessage struct {
 	Record        *DHTRecord
 	CloserPeers   []peer.AddrInfo
 	ProviderPeers []peer.AddrInfo
+
+	rawSize int
 }
 
 type DHTRecord struct {
@@ -37,18 +40,42 @@ const (
 	PING
 )
 
-func NewPingMsg() *DHTMessage {
-	return &DHTMessage{
-		Type: PING,
-		Key:  "",
+// Converts a raw byte message to a DHTMessage
+func NewDHTMsg(raw []byte) (*DHTMessage, error) {
+	var msg pb.Message
+	err := msg.Unmarshal(raw)
+	if err != nil {
+		return nil, fmt.Errorf("error unmarshalling message: %v", err)
 	}
-}
 
-func NewFindNodeMsg(key []byte) *DHTMessage {
-	return &DHTMessage{
-		Type: FIND_NODE,
-		Key:  string(key),
+	closerPeers, err := toAddrInfos(msg.CloserPeers)
+	if err != nil {
+		return nil, fmt.Errorf("error converting CloserPeers to AddrInfo: %v", err)
 	}
+
+	providerPeers, err := toAddrInfos(msg.ProviderPeers)
+	if err != nil {
+		return nil, fmt.Errorf("error converting ProviderPeers to AddrInfo: %v", err)
+	}
+
+	dhtMsg := &DHTMessage{
+		Type:          MessageType(msg.GetType()),
+		ClusterLevel:  msg.ClusterLevelRaw,
+		Key:           string(msg.GetKey()),
+		CloserPeers:   closerPeers,
+		ProviderPeers: providerPeers,
+		rawSize:       len(raw),
+	}
+
+	if msg.Record != nil {
+		dhtMsg.Record = &DHTRecord{
+			Key:          string(msg.Record.Key),
+			Value:        msg.Record.Value,
+			TimeReceived: msg.Record.TimeReceived,
+		}
+	}
+
+	return dhtMsg, nil
 }
 
 func (msg *DHTMessage) Marshal() ([]byte, error) {
@@ -78,40 +105,34 @@ func (msg *DHTMessage) Marshal() ([]byte, error) {
 	return res, nil
 }
 
-func NewDHTMsg(msgRaw []byte) (*DHTMessage, error) {
-	var msg pb.Message
-	err := msg.Unmarshal(msgRaw)
+func makeFindNodeMsg() []byte {
+	// Generate random key to query
+	key := make([]byte, 16)
+	rand.Read(key)
+
+	msg := &DHTMessage{
+		Type: FIND_NODE,
+		Key:  string(key),
+	}
+
+	res, err := msg.Marshal()
 	if err != nil {
-		return nil, fmt.Errorf("error unmarshalling message: %v", err)
+		panic(err) // If we fail to marshal our own message, something is very wrong
+	}
+	return res
+}
+
+func makePingMsg() []byte {
+	msg := &DHTMessage{
+		Type: PING,
+		Key:  "",
 	}
 
-	closerPeers, err := toAddrInfos(msg.CloserPeers)
+	res, err := msg.Marshal()
 	if err != nil {
-		return nil, fmt.Errorf("error converting CloserPeers to AddrInfo: %v", err)
+		panic(err) // If we fail to marshal our own message, something is very wrong
 	}
-
-	providerPeers, err := toAddrInfos(msg.ProviderPeers)
-	if err != nil {
-		return nil, fmt.Errorf("error converting ProviderPeers to AddrInfo: %v", err)
-	}
-
-	dhtMsg := &DHTMessage{
-		Type:          MessageType(msg.GetType()),
-		ClusterLevel:  msg.ClusterLevelRaw,
-		Key:           string(msg.GetKey()),
-		CloserPeers:   closerPeers,
-		ProviderPeers: providerPeers,
-	}
-
-	if msg.Record != nil {
-		dhtMsg.Record = &DHTRecord{
-			Key:          string(msg.Record.Key),
-			Value:        msg.Record.Value,
-			TimeReceived: msg.Record.TimeReceived,
-		}
-	}
-
-	return dhtMsg, nil
+	return res
 }
 
 func toAddrInfos(msgPeers []pb.Message_Peer) ([]peer.AddrInfo, error) {
