@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"fmt"
 
 	"github.com/wadeAlexC/ipbw/crawler"
@@ -17,6 +16,5 @@ func main() {
 		return
 	}
 
-	err = dht.Start(context.Background())
-	panic(err)
+	dht.Start()
 }

@@ -8,6 +8,13 @@ This package reimplements portions of [`go-libp2p-kad-dht`](https://github.com/l
 
 Just `go run main.go`. Configurability is a trap and should be avoided.
 
+## TODO
+
+- Workers burning through allConnectable. Should probably implement a soft connection cap that stops more workers being spawned until we finish connecting.
+- Filter IPs to get rid of garbage
+- Better error handling: log files are difficult to read
+- Crawl Filecoin nodes
+
 ## How does the DHT work?
 
 
