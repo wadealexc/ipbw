@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"strings"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -43,6 +44,8 @@ type DHT struct {
 
 	connected *types.PeerList // Peers we are currently connected to
 	backlog   *types.PeerList // Peers we have not tried to connect to
+
+	stats *DHTStats
 }
 
 func NewDHT() (*DHT, error) {
@@ -68,22 +71,27 @@ func NewDHT() (*DHT, error) {
 		known:        types.NewIDMap(),
 		disconnected: types.NewIDMap(),
 		unreachable:  types.NewIDMap(),
-		connected:    types.NewPeerList(),
-		backlog:      types.NewPeerList(),
+		connected:    types.NewPeerList(MIN_CONNECTED),
+		backlog:      types.NewPeerList(0),
+		stats:        NewDHTStats(),
 	}
 
-	// TODO: actually handle incoming connections
+	// Handler for incoming connections from peers
 	host.SetStreamHandler(types.DHT_PROTO, dht.handleIncoming)
 
 	return dht, nil
 }
 
+// Start does three important things:
+// 1. Sets up listeners to manage workload during the crawl
+// 2. Connects to bootstrap peers and begins crawling
+// 3. Prints stats at regular intervals
 func (dht *DHT) Start() {
 
 	ctx, cancel := context.WithCancel(context.Background())
 
 	// Record start time
-	dht.startTime = time.Now()
+	dht.stats.setStartTime()
 
 	// Set up listeners for events during the crawl
 	dht.setup(ctx)
@@ -114,6 +122,7 @@ func (dht *DHT) Start() {
 	}
 }
 
+// Set up listeners to manage workload during the crawl
 func (dht *DHT) setup(ctx context.Context) {
 
 	// This function will be called when our connected peers
@@ -127,10 +136,9 @@ func (dht *DHT) setup(ctx context.Context) {
 	maybeConnect := func() {
 		// Pull from backlog until we've reached MAX_WORKERS
 		for dht.workerCount() < MAX_WORKERS {
-			peer, empty := dht.backlog.Pop()
+			peer, popped := dht.backlog.Pop()
 			// No peers in backlog; do nothing
-			if empty {
-				fmt.Printf("No peers in backlog!\n")
+			if !popped {
 				return
 			}
 
@@ -138,8 +146,8 @@ func (dht *DHT) setup(ctx context.Context) {
 		}
 	}
 
-	// Set connected to notify us when we're under MIN_CONNECTED
-	dht.connected.SetNotifySize(MIN_CONNECTED)
+	// Emitted on adds/removes if connected has fewer than
+	// MIN_CONNECTED peers
 	dht.connected.On("under-limit", maybeConnect)
 
 	// Emitted when we add new peers to the backlog
@@ -147,11 +155,10 @@ func (dht *DHT) setup(ctx context.Context) {
 
 	// Emitted each time a peer tells us about new peers
 	dht.On("new-peers", func(addrs []peer.AddrInfo) {
-
 		newPeers := make([]*types.Peer, 0, len(addrs))
 
 		for _, addr := range addrs {
-			// Add peer to DHT. If we already knew about this peer,
+			// Add peer to known. If we already knew about this peer,
 			// we do nothing.
 			added := dht.known.Add(addr.ID)
 			if !added {
@@ -163,65 +170,18 @@ func (dht *DHT) setup(ctx context.Context) {
 			newPeers = append(newPeers, p)
 		}
 
-		// Add all new peers to backlog. We'll connect to them
-		// if we drop below MIN_CONNECTED connections
+		// Add all new peers to backlog. We'll connect to them:
+		// 1. If we drop below MIN_CONNECTED connections
+		// 2. If we have fewer than MAX_WORKERS workers
 		dht.backlog.AddAll(newPeers)
 	})
 }
 
-// Set up listeners for a peer and attempt to connect to them
-func (dht *DHT) connect(ctx context.Context, p *types.Peer) {
-	// Set up callbacks for peer:
-
-	// Fired when we successfully connect to the peer
-	p.Once("connected", func() {
-		// Fired if we get an error reading/writing to the peer
-		p.Once("error", func(err error) {
-			dht.logDCError(err)
-			p.Disconnect()
-		})
-
-		// Fired when we disconnect from the peer
-		p.Once("disconnected", func() {
-			// Clean up:
-			p.RemoveAllListeners()
-			atomic.AddInt64(&dht.numWorkers, -1)
-			// Remove from connected and add to disconnected
-			dht.connected.Remove(p)
-			dht.disconnected.Add(p.ID)
-		})
-
-		// Fired each time we read a message from this peer
-		p.On("read-message", func(mType types.MessageType, mSize int, addrs []peer.AddrInfo) {
-			dht.logRead(mType, mSize)
-			dht.Emit("new-peers", addrs)
-		})
-
-		// Fired each time we write a message to this peer
-		p.On("write-message", func(mType types.MessageType, mSize int) {
-			dht.logWrite(mType, mSize)
-		})
-
-		// Add to active connections and start worker
-		dht.connected.Add(p)
-		go p.Worker(ctx)
-	})
-
-	// Fired if we are unable to connect to the peer
-	p.Once("unreachable", func(err error) {
-		// Clean up:
-		p.RemoveAllListeners()
-		atomic.AddInt64(&dht.numWorkers, -1)
-		// Log error and add to unreachable
-		dht.logConnError(err)
-		dht.unreachable.Add(p.ID)
-	})
-
-	// Record new worker and try connecting
-	atomic.AddInt64(&dht.numWorkers, 1)
-	go p.TryConnect(dht.host)
-}
-
+// Connect to each bootstrap peer and begin asking them
+// for peers.
+//
+// If we're unable to connect to any bootstrap peers, this
+// method panics.
 func (dht *DHT) bootstrap(ctx context.Context) {
 
 	bootstrapPeers := kadDHT.GetDefaultBootstrapPeerAddrInfos()
@@ -229,17 +189,18 @@ func (dht *DHT) bootstrap(ctx context.Context) {
 	numUnreachable := uint64(0)
 	maxUnreachable := uint64(len(bootstrapPeers))
 
-	// Connect to bootstrap peers
 	for _, addr := range bootstrapPeers {
+		// Add peer as "known"
+		dht.known.Add(addr.ID)
 
 		p := types.NewPeer(addr)
 
 		// Set up special listeners for our bootstrap peers:
-
 		p.Once("connected", func() {
 			fmt.Printf("Connected to bootstrap peer: %s @ %v\n", addr.ID.Pretty(), addr.Addrs)
 		})
 
+		// Emitted if we were unable to reach a bootstrap peer
 		p.Once("unreachable", func(err error) {
 			fmt.Printf("Error connecting to bootstrap peer: %v\n", err)
 
@@ -254,28 +215,117 @@ func (dht *DHT) bootstrap(ctx context.Context) {
 	}
 }
 
-func (dht *DHT) handleIncoming(s network.Stream) {
-	// TODO
+// Initiate an outbound connection to a peer:
+// 1. Set up callbacks to listen to reads / writes / etc for this peer
+// 2. Attempt to connect
+func (dht *DHT) connect(ctx context.Context, p *types.Peer) {
+	// Record new worker
+	atomic.AddInt64(&dht.numWorkers, 1)
+
+	// Set up callbacks to listen for events from peer:
+	dht.addListeners(ctx, p)
+
+	// Try connecting to peer
+	go p.TryConnect(dht.host)
+}
+
+// Called by libp2p when a peer connects to us using the
+// DHT protocol handler. If we don't already know the peer,
+// we start a worker for them.
+//
+// NOTE: We could do other things here to manage inbound connections
+// from peers we already know, but the most likely scenario is
+// that we already have a worker for them. So, let's not
+// complicate the matter!
+func (dht *DHT) handleIncoming(stream network.Stream) {
+	// Get info on remote peer connecting to us
+	pid := stream.Conn().RemotePeer()
+	addrs := dht.host.Peerstore().Addrs(pid)
+	addrInfo := peer.AddrInfo{
+		ID:    pid,
+		Addrs: addrs,
+	}
+
+	p := types.NewPeer(addrInfo)
+
+	// Try to add peer to known. If we successfully added them,
+	// we can start a worker immediately.
+	if added := dht.known.Add(p.ID); !added {
+		return
+	}
+
+	// Record new worker
+	atomic.AddInt64(&dht.numWorkers, 1)
+	dht.connected.Add(p)
+
+	// Set up callbacks to listen for events from peer:
+	dht.addListeners(context.Background(), p)
+
+	// Give peer the stream and emit connected -
+	// listeners will start work.
+	p.SetStream(stream)
+	p.Emit("connected")
+
+	dht.stats.logInboundConn(p)
+}
+
+func (dht *DHT) addListeners(ctx context.Context, p *types.Peer) {
+	// Set up listeners for DHTStats - allows us to log
+	// without blocking
+	// dht.stats.listen(p)
+
+	// Fired when we successfully connect to the peer
+	p.Once("connected", func() {
+
+		// Auto-disconnect after 5 minutes
+		pCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+
+		// Fired if we get an error reading/writing to the peer
+		p.Once("error", func(err error) {
+			dht.stats.logDCError(p, err)
+			p.Disconnect()
+		})
+
+		// Fired when we disconnect from the peer
+		p.Once("disconnected", func() {
+			// Clean up:
+			cancel()
+			p.RemoveAllListeners()
+			atomic.AddInt64(&dht.numWorkers, -1)
+			// Remove from connected and add to disconnected
+			dht.connected.Remove(p)
+			dht.disconnected.Add(p.ID)
+		})
+
+		// Fired each time we read a message from this peer
+		p.On("read-message", func(mType types.MessageType, mSize int, addrs []peer.AddrInfo) {
+			dht.stats.logRead(p, mType, mSize)
+			dht.Emit("new-peers", addrs)
+		})
+
+		// Fired each time we write a message to this peer
+		p.On("write-message", func(mType types.MessageType, mSize int) {
+			dht.stats.logWrite(p, mType, mSize)
+		})
+
+		// Add to active connections and start worker
+		dht.connected.Add(p)
+		go p.Worker(pCtx)
+	})
+
+	// Fired if we are unable to connect to the peer
+	p.Once("unreachable", func(err error) {
+		// Clean up:
+		p.RemoveAllListeners()
+		atomic.AddInt64(&dht.numWorkers, -1)
+		// Log error and add to unreachable
+		dht.stats.logConnError(p, err)
+		dht.unreachable.Add(p.ID)
+	})
 }
 
 func (dht *DHT) workerCount() int64 {
 	return atomic.LoadInt64(&dht.numWorkers)
-}
-
-func (dht *DHT) logRead(mType types.MessageType, mSize int) {
-	// TODO
-}
-
-func (dht *DHT) logWrite(mType types.MessageType, mSize int) {
-	// TODO
-}
-
-func (dht *DHT) logDCError(err error) {
-	// TODO
-}
-
-func (dht *DHT) logConnError(err error) {
-	// TODO
 }
 
 func (dht *DHT) printStats() {
@@ -288,7 +338,7 @@ func (dht *DHT) printStats() {
 	strs = append(strs, fmt.Sprintf("========================="))
 
 	// Duration
-	timeElapsed := time.Since(dht.startTime)
+	timeElapsed := dht.stats.getTimeElapsed()
 	hours := uint64(timeElapsed.Hours())
 	minutes := uint64(timeElapsed.Minutes()) % 60
 	seconds := uint64(timeElapsed.Seconds()) % 60
@@ -304,4 +354,5 @@ func (dht *DHT) printStats() {
 
 	strs = append(strs, fmt.Sprintf("Number of active workers: %d", dht.workerCount()))
 
+	fmt.Println(strings.Join(strs, "\n"))
 }

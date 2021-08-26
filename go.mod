@@ -14,7 +14,7 @@ require (
 	github.com/libp2p/go-msgio v0.0.6
 	github.com/multiformats/go-multiaddr v0.3.3
 	github.com/multiformats/go-multihash v0.0.15 // indirect
-	github.com/wadeAlexC/go-events v0.0.4
+	github.com/wadeAlexC/go-events v0.0.6
 	golang.org/x/crypto v0.0.0-20210506145944-38f3c27a63bf // indirect
 	golang.org/x/sys v0.0.0-20210511113859-b0526f3d8744 // indirect
 )

@@ -51,6 +51,10 @@ func (p *Peer) TryConnect(host host.Host) {
 	p.Emit("connected")
 }
 
+func (p *Peer) SetStream(stream network.Stream) {
+	p.stream = stream
+}
+
 func (p *Peer) Disconnect() {
 	p.stream.Reset()
 
@@ -58,19 +62,20 @@ func (p *Peer) Disconnect() {
 }
 
 func (p *Peer) Worker(ctx context.Context) {
+	go p.writes(ctx)
+	go p.reads(ctx)
+}
 
-	reader := msgio.NewVarintReaderSize(p.stream, network.MessageSizeMax)
+func (p *Peer) writes(ctx context.Context) {
+
 	writer := msgio.NewVarintWriter(p.stream)
 
-	disconnectTicker := time.NewTicker(5 * time.Minute)
 	findNodeTicker := time.NewTicker(10 * time.Second)
 	pingTicker := time.NewTicker(30 * time.Second)
 
-	// Perform FIND_NODE / PING writes at intervals, and read
-	// messages until:
+	// Perform FIND_NODE / PING writes at intervals until:
 	// 1. We encounter an error
 	// 2. We get a signal to stop (via ctx)
-	// 3. The disconnect ticker elapses (5 min)
 	for {
 		select {
 		case <-ctx.Done():
@@ -85,6 +90,8 @@ func (p *Peer) Worker(ctx context.Context) {
 				p.Emit("error", err)
 				return
 			}
+
+			p.Emit("write-message", FIND_NODE, len(msg))
 		case <-pingTicker.C:
 			msg := makePingMsg()
 
@@ -94,56 +101,69 @@ func (p *Peer) Worker(ctx context.Context) {
 				p.Emit("error", err)
 				return
 			}
-		case <-disconnectTicker.C:
-			p.Disconnect()
+
+			p.Emit("write-message", PING, len(msg))
+		}
+	}
+}
+
+func (p *Peer) reads(ctx context.Context) {
+
+	reader := msgio.NewVarintReaderSize(p.stream, network.MessageSizeMax)
+
+	for {
+		select {
+		case <-ctx.Done():
+			p.stream.Reset()
 			return
 		default:
-			// TODO add identification handling here
-			// (protos / user agents / etc)
+		}
 
-			// Read message from peer
-			msgRaw, err := reader.ReadMsg()
-			if err != nil {
-				reader.ReleaseMsg(msgRaw)
-				p.Emit("error", err)
-				return
-			} else if msgRaw == nil {
+		// TODO add identification handling here
+		// (protos / user agents / etc)
+
+		// Read message from peer
+		msgRaw, err := reader.ReadMsg()
+		if err != nil {
+			reader.ReleaseMsg(msgRaw)
+			p.Emit("error", err)
+			return
+		} else if msgRaw == nil {
+			continue
+		}
+
+		// Unmarshal / convert to DHTMessage
+		msg, err := NewDHTMsg(msgRaw)
+		reader.ReleaseMsg(msgRaw)
+		if err != nil {
+			p.Emit("error", err)
+			return
+		}
+
+		newPeers := make([]peer.AddrInfo, 0)
+
+		// Collect any peers this peer is reporting to us
+		for _, peer := range msg.CloserPeers {
+			// Add peer to this peer's reported peers. If we already
+			// knew about this peer, continue
+			if added := p.known.Add(peer.ID); !added {
 				continue
 			}
 
-			// Unmarshal / convert to DHTMessage
-			msg, err := NewDHTMsg(msgRaw)
-			reader.ReleaseMsg(msgRaw)
-			if err != nil {
-				p.Emit("error", err)
-				return
-			}
-
-			newPeers := make([]peer.AddrInfo, 0)
-
-			// Collect any peers this peer is reporting to us
-			for _, peer := range msg.CloserPeers {
-				// Add peer to this peer's reported peers. If we already
-				// knew about this peer, continue
-				if added := p.known.Add(peer.ID); !added {
-					continue
-				}
-
-				newPeers = append(newPeers, peer)
-			}
-
-			for _, peer := range msg.ProviderPeers {
-				// Add peer to this peer's reported peers. If we already
-				// knew about this peer, continue
-				if added := p.known.Add(peer.ID); !added {
-					continue
-				}
-
-				newPeers = append(newPeers, peer)
-			}
-
-			// Finish this read:
-			p.Emit("read-message", msg.Type, msg.rawSize, newPeers)
+			newPeers = append(newPeers, peer)
 		}
+
+		for _, peer := range msg.ProviderPeers {
+			// Add peer to this peer's reported peers. If we already
+			// knew about this peer, continue
+			if added := p.known.Add(peer.ID); !added {
+				continue
+			}
+
+			newPeers = append(newPeers, peer)
+		}
+
+		// Finish this read:
+		p.Emit("read-message", msg.Type, msg.rawSize, newPeers)
 	}
 }

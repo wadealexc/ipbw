@@ -17,6 +17,14 @@ func NewIDMap() *IDMap {
 	}
 }
 
+func (m *IDMap) Contains(id peer.ID) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	_, contains := m.ids[id]
+	return contains
+}
+
 func (m *IDMap) Count() int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -33,9 +41,25 @@ func (m *IDMap) Add(id peer.ID) bool {
 	defer m.mu.Unlock()
 
 	if _, known := m.ids[id]; known {
-		return true
+		return false
 	}
 
 	m.ids[id] = struct{}{}
-	return false
+	return true
+}
+
+// Remove removes the ID from the map, doing nothing
+// if it is not in the map.
+//
+// Returns true if the ID was removed.
+func (m *IDMap) Remove(id peer.ID) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if _, known := m.ids[id]; !known {
+		return false
+	}
+
+	delete(m.ids, id)
+	return true
 }
