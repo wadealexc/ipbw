@@ -144,7 +144,7 @@ func (st *DHTStats) getReadStats() []string {
 	strs := []string{}
 
 	strs = append(strs, fmt.Sprintf("READ STATS:"))
-	strs = append(strs, fmt.Sprintf("Total bytes read: %d", st.totalReadSize))
+	strs = append(strs, fmt.Sprintf("Total amount read: %d MiB", st.totalReadSize>>20))
 	strs = append(strs, fmt.Sprintf("Messages read: %d; by type:", st.totalReads))
 	strs = append(strs, fmt.Sprintf("- PUT_VALUE: %d", st.readsByMsgType[int32(types.PUT_VALUE)]))
 	strs = append(strs, fmt.Sprintf("- GET_VALUE: %d", st.readsByMsgType[int32(types.GET_VALUE)]))
@@ -172,7 +172,7 @@ func (st *DHTStats) getWriteStats() []string {
 	strs := []string{}
 
 	strs = append(strs, fmt.Sprintf("WRITE STATS:"))
-	strs = append(strs, fmt.Sprintf("Total bytes written: %d", st.totalWriteSize))
+	strs = append(strs, fmt.Sprintf("Total amount written: %d KiB", st.totalWriteSize>>10))
 	strs = append(strs, fmt.Sprintf("Messages written: %d; by type:", st.totalWrites))
 	strs = append(strs, fmt.Sprintf("- FIND_NODE: %d", st.writesByMsgType[int32(types.FIND_NODE)]))
 	strs = append(strs, fmt.Sprintf("- PING: %d", st.writesByMsgType[int32(types.PING)]))

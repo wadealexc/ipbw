@@ -100,7 +100,7 @@ func (dht *DHT) Start() {
 	dht.bootstrap(ctx)
 
 	// Create timers to stop crawl and print stats
-	stopTicker := time.NewTicker(2 * time.Minute)
+	stopTicker := time.NewTicker(5 * time.Minute)
 	statsTicker := time.NewTicker(10 * time.Second)
 
 	ch := make(chan os.Signal, 1)
@@ -326,7 +326,6 @@ func (dht *DHT) addListeners(ctx context.Context, p *types.Peer) {
 		// Fired once we've identified metadata about this peer
 		// Metadata comes from the libp2p ID protocol
 		p.Once("identified", func(protos []string, protoVersion string, agent string) {
-			// fmt.Printf("ID:\nProtocols: %v\nProtoVersion: %s\nAgent: %s\n", protos, protoVersion, agent)
 			dht.stats.logIdentify(p, protos, protoVersion, agent)
 		})
 
