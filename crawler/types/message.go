@@ -105,6 +105,10 @@ func (msg *DHTMessage) Marshal() ([]byte, error) {
 	return res, nil
 }
 
+func IsKnownMsgType(t int32) bool {
+	return int32(PUT_VALUE) <= t && t <= int32(PING)
+}
+
 func makeFindNodeMsg() []byte {
 	// Generate random key to query
 	key := make([]byte, 16)

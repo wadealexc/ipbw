@@ -143,3 +143,30 @@ func (pl *PeerList) Pop() (*Peer, bool) {
 
 	return p, true
 }
+
+// ForEach iterates over all peers, calling the callback
+// for each peer. If the callback returns true, the peer
+// will be removed after iteration.
+// ForEach returns the number of peers removed
+//
+// NOTE: This method may hold pl.mu.Lock for a long time
+func (pl *PeerList) ForEach(cb func(p *Peer) bool) uint64 {
+	pl.mu.Lock()
+	defer pl.mu.Unlock()
+
+	removeCount := uint64(0)
+	newPeers := make([]*Peer, 0, len(pl.peers))
+
+	for _, peer := range pl.peers {
+		remove := cb(peer)
+		if remove {
+			removeCount++
+			pl.known.Remove(peer.ID)
+		} else {
+			newPeers = append(newPeers, peer)
+		}
+	}
+
+	pl.peers = newPeers
+	return removeCount
+}

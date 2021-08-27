@@ -100,7 +100,7 @@ func (dht *DHT) Start() {
 	dht.bootstrap(ctx)
 
 	// Create timers to stop crawl and print stats
-	stopTicker := time.NewTicker(10 * time.Minute)
+	stopTicker := time.NewTicker(2 * time.Minute)
 	statsTicker := time.NewTicker(10 * time.Second)
 
 	ch := make(chan os.Signal, 1)
@@ -109,10 +109,10 @@ func (dht *DHT) Start() {
 	for {
 		select {
 		case <-statsTicker.C:
-			dht.printStats()
+			dht.printCrawlStatus(getHeader("CRAWL INFO"))
 		case <-stopTicker.C:
-			fmt.Println("Stopping crawl...")
 			cancel()
+			dht.EmitSync("stop")
 			return
 		case <-ch:
 			fmt.Println("Stopping crawl from user interrupt...")
@@ -175,6 +175,33 @@ func (dht *DHT) setup(ctx context.Context) {
 		// 2. If we have fewer than MAX_WORKERS workers
 		dht.backlog.AddAll(newPeers)
 	})
+
+	// Emitted when the crawl is being stopped
+	dht.Once("stop", func() {
+		fmt.Printf("Stopping crawl...\n")
+
+		start := time.Now()
+
+		// Force all workers to disconnect from their peers, and remove
+		// them from connected
+		numRemoved := dht.connected.ForEach(func(p *types.Peer) (remove bool) {
+			p.RemoveAllListeners()
+			p.HangUp()
+			dht.disconnected.Add(p.ID)
+			atomic.AddInt64(&dht.numWorkers, -1)
+			return true
+		})
+
+		elapsed := time.Since(start).Milliseconds()
+		fmt.Printf("Disconnected from %d peers in %d ms\n", numRemoved, elapsed)
+
+		// Print final status w/ disconnect info
+		header := getHeader("FINAL CRAWL STATUS")
+		dht.printCrawlStatus(header)
+
+		// Print stats from the crawl
+		dht.stats.printStats()
+	})
 }
 
 // Connect to each bootstrap peer and begin asking them
@@ -202,7 +229,7 @@ func (dht *DHT) bootstrap(ctx context.Context) {
 
 		// Emitted if we were unable to reach a bootstrap peer
 		p.Once("unreachable", func(err error) {
-			fmt.Printf("Error connecting to bootstrap peer: %v\n", err)
+			fmt.Printf("Error connecting to bootstrap peer %s @ %v: %v\n", addr.ID.Pretty(), addr.Addrs, err)
 
 			atomic.AddUint64(&numUnreachable, 1)
 			if atomic.LoadUint64(&numUnreachable) >= maxUnreachable {
@@ -270,10 +297,6 @@ func (dht *DHT) handleIncoming(stream network.Stream) {
 }
 
 func (dht *DHT) addListeners(ctx context.Context, p *types.Peer) {
-	// Set up listeners for DHTStats - allows us to log
-	// without blocking
-	// dht.stats.listen(p)
-
 	// Fired when we successfully connect to the peer
 	p.Once("connected", func() {
 
@@ -282,7 +305,7 @@ func (dht *DHT) addListeners(ctx context.Context, p *types.Peer) {
 
 		// Fired if we get an error reading/writing to the peer
 		p.Once("error", func(err error) {
-			dht.stats.logDCError(p, err)
+			dht.stats.logError(p, err)
 			p.Disconnect()
 		})
 
@@ -291,16 +314,26 @@ func (dht *DHT) addListeners(ctx context.Context, p *types.Peer) {
 			// Clean up:
 			cancel()
 			p.RemoveAllListeners()
-			atomic.AddInt64(&dht.numWorkers, -1)
 			// Remove from connected and add to disconnected
-			dht.connected.Remove(p)
 			dht.disconnected.Add(p.ID)
+			if removed := dht.connected.Remove(p); removed {
+				// Only decrease numWorkers if we removed from connected
+				// That way a racing condition won't mess with this value.
+				atomic.AddInt64(&dht.numWorkers, -1)
+			}
+		})
+
+		// Fired once we've identified metadata about this peer
+		// Metadata comes from the libp2p ID protocol
+		p.Once("identified", func(protos []string, protoVersion string, agent string) {
+			// fmt.Printf("ID:\nProtocols: %v\nProtoVersion: %s\nAgent: %s\n", protos, protoVersion, agent)
+			dht.stats.logIdentify(p, protos, protoVersion, agent)
 		})
 
 		// Fired each time we read a message from this peer
 		p.On("read-message", func(mType types.MessageType, mSize int, addrs []peer.AddrInfo) {
-			dht.stats.logRead(p, mType, mSize)
 			dht.Emit("new-peers", addrs)
+			dht.stats.logRead(p, mType, mSize)
 		})
 
 		// Fired each time we write a message to this peer
@@ -310,7 +343,7 @@ func (dht *DHT) addListeners(ctx context.Context, p *types.Peer) {
 
 		// Add to active connections and start worker
 		dht.connected.Add(p)
-		go p.Worker(pCtx)
+		go p.Worker(pCtx, dht.host.Peerstore())
 	})
 
 	// Fired if we are unable to connect to the peer
@@ -319,7 +352,7 @@ func (dht *DHT) addListeners(ctx context.Context, p *types.Peer) {
 		p.RemoveAllListeners()
 		atomic.AddInt64(&dht.numWorkers, -1)
 		// Log error and add to unreachable
-		dht.stats.logConnError(p, err)
+		dht.stats.logUnreachable(p, err)
 		dht.unreachable.Add(p.ID)
 	})
 }
@@ -328,15 +361,7 @@ func (dht *DHT) workerCount() int64 {
 	return atomic.LoadInt64(&dht.numWorkers)
 }
 
-func (dht *DHT) printStats() {
-
-	strs := []string{}
-
-	// Header
-	strs = append(strs, fmt.Sprintf("========================="))
-	strs = append(strs, fmt.Sprintf("CRAWL INFO:"))
-	strs = append(strs, fmt.Sprintf("========================="))
-
+func (dht *DHT) printCrawlStatus(strs []string) {
 	// Duration
 	timeElapsed := dht.stats.getTimeElapsed()
 	hours := uint64(timeElapsed.Hours())
@@ -346,13 +371,26 @@ func (dht *DHT) printStats() {
 
 	// Basic info
 	strs = append(strs, fmt.Sprintf("Unique peers discovered: %d", dht.known.Count()))
-
 	strs = append(strs, fmt.Sprintf("Current connections: %d", dht.connected.Count()))
 	strs = append(strs, fmt.Sprintf("Peers in backlog: %d", dht.backlog.Count()))
 	strs = append(strs, fmt.Sprintf("Total disconnected: %d", dht.disconnected.Count()))
 	strs = append(strs, fmt.Sprintf("Total unreachable: %d", dht.unreachable.Count()))
-
 	strs = append(strs, fmt.Sprintf("Number of active workers: %d", dht.workerCount()))
 
+	strs = append(strs, getFooter())
 	fmt.Println(strings.Join(strs, "\n"))
+}
+
+func getHeader(header string) []string {
+	strs := []string{}
+
+	strs = append(strs, fmt.Sprintf("========================="))
+	strs = append(strs, fmt.Sprintf("%s:", header))
+	strs = append(strs, fmt.Sprintf("========================="))
+
+	return strs
+}
+
+func getFooter() string {
+	return "========================="
 }

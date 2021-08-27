@@ -2,11 +2,14 @@ package types
 
 import (
 	"context"
+	"fmt"
+	"sync"
 	"time"
 
 	"github.com/libp2p/go-libp2p-core/host"
 	"github.com/libp2p/go-libp2p-core/network"
 	"github.com/libp2p/go-libp2p-core/peer"
+	"github.com/libp2p/go-libp2p-core/peerstore"
 	"github.com/libp2p/go-msgio"
 	ma "github.com/multiformats/go-multiaddr"
 	"github.com/wadeAlexC/go-events/events"
@@ -20,6 +23,11 @@ type Peer struct {
 	ID    peer.ID
 	Addrs []ma.Multiaddr
 
+	idMu         sync.Mutex
+	protocols    []string
+	protoVersion string
+	userAgent    string
+
 	stream network.Stream
 
 	known *IDMap // All the peer IDs we've heard about from this peer
@@ -27,10 +35,11 @@ type Peer struct {
 
 func NewPeer(addr peer.AddrInfo) *Peer {
 	return &Peer{
-		Emitter: events.NewEmitter(),
-		ID:      addr.ID,
-		Addrs:   addr.Addrs,
-		known:   NewIDMap(),
+		Emitter:   events.NewEmitter(),
+		ID:        addr.ID,
+		Addrs:     addr.Addrs,
+		protocols: make([]string, 0),
+		known:     NewIDMap(),
 	}
 }
 
@@ -61,9 +70,14 @@ func (p *Peer) Disconnect() {
 	p.Emit("disconnected")
 }
 
-func (p *Peer) Worker(ctx context.Context) {
+func (p *Peer) HangUp() {
+	p.stream.Reset()
+}
+
+func (p *Peer) Worker(ctx context.Context, pStore peerstore.Peerstore) {
 	go p.writes(ctx)
 	go p.reads(ctx)
+	go p.identify(ctx, pStore)
 }
 
 func (p *Peer) writes(ctx context.Context) {
@@ -79,7 +93,7 @@ func (p *Peer) writes(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
-			p.stream.Reset()
+			p.Disconnect()
 			return
 		case <-findNodeTicker.C:
 			msg := makeFindNodeMsg()
@@ -114,13 +128,12 @@ func (p *Peer) reads(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
-			p.stream.Reset()
+			p.Disconnect()
 			return
 		default:
 		}
 
-		// TODO add identification handling here
-		// (protos / user agents / etc)
+		// TODO handle err == io.EOF
 
 		// Read message from peer
 		msgRaw, err := reader.ReadMsg()
@@ -166,4 +179,88 @@ func (p *Peer) reads(ctx context.Context) {
 		// Finish this read:
 		p.Emit("read-message", msg.Type, msg.rawSize, newPeers)
 	}
+}
+
+func (p *Peer) identify(ctx context.Context, pStore peerstore.Peerstore) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
+		protos := p.getProtocols(pStore)
+		protoVersion := p.getProtoVersion(pStore)
+		agent := p.getUserAgent(pStore)
+
+		if len(protos) != 0 && protoVersion != "" && agent != "" {
+			p.Emit("identified", protos, protoVersion, agent)
+			return
+		}
+
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+// Attempt to read the peer's protocols from the libp2p peerstore
+// If we fail, returns nil
+// If we succeed, but no protocols are set, returns []string{"NONE"}
+func (p *Peer) getProtocols(pStore peerstore.Peerstore) []string {
+	p.idMu.Lock()
+	defer p.idMu.Unlock()
+
+	if len(p.protocols) == 0 {
+		protos, err := pStore.GetProtocols(p.ID)
+		if err != nil {
+			return nil
+		} else if len(protos) == 0 {
+			protos = []string{"NONE"}
+		}
+
+		p.protocols = protos
+	}
+
+	return p.protocols
+}
+
+// Attempt to read the peer's protocol version from the libp2p peerstore
+// If we fail, returns ""
+// If we succeed, but the version is empty, return "NONE"
+func (p *Peer) getProtoVersion(pStore peerstore.Peerstore) string {
+	p.idMu.Lock()
+	defer p.idMu.Unlock()
+
+	if p.protoVersion == "" {
+		version, err := pStore.Get(p.ID, "ProtocolVersion")
+		if err != nil {
+			return ""
+		} else if version == nil {
+			version = "NONE"
+		}
+
+		p.protoVersion = fmt.Sprintf("%s", version)
+	}
+
+	return p.protoVersion
+}
+
+// Attempt to read the peer's user agent from the libp2p peerstore
+// If we fail, returns ""
+// If we succeed, but the user agent is empty, return "NONE"
+func (p *Peer) getUserAgent(pStore peerstore.Peerstore) string {
+	p.idMu.Lock()
+	defer p.idMu.Unlock()
+
+	if p.userAgent == "" {
+		agent, err := pStore.Get(p.ID, "AgentVersion")
+		if err != nil {
+			return ""
+		} else if agent == nil {
+			agent = "NONE"
+		}
+
+		p.userAgent = fmt.Sprintf("%s", agent)
+	}
+
+	return p.userAgent
 }
