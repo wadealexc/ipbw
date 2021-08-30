@@ -32,11 +32,11 @@ const USER_AGENT = "IPBW"
 
 type DHT struct {
 	*events.Emitter
-
 	host host.Host
 
+	crawlDuration uint
+
 	numWorkers int64
-	startTime  time.Time
 
 	known        *types.IDMap // All unique peers we have heard about
 	disconnected *types.IDMap // Peers we have disconnected from
@@ -48,7 +48,7 @@ type DHT struct {
 	stats *DHTStats
 }
 
-func NewDHT() (*DHT, error) {
+func NewDHT(duration uint) (*DHT, error) {
 	// Generate a new identity
 	pk, _, err := crypto.GenerateKeyPair(crypto.RSA, 2048)
 	if err != nil {
@@ -66,14 +66,15 @@ func NewDHT() (*DHT, error) {
 	}
 
 	dht := &DHT{
-		Emitter:      events.NewEmitter(),
-		host:         host,
-		known:        types.NewIDMap(),
-		disconnected: types.NewIDMap(),
-		unreachable:  types.NewIDMap(),
-		connected:    types.NewPeerList(MIN_CONNECTED),
-		backlog:      types.NewPeerList(0),
-		stats:        NewDHTStats(),
+		Emitter:       events.NewEmitter(),
+		host:          host,
+		crawlDuration: duration,
+		known:         types.NewIDMap(),
+		disconnected:  types.NewIDMap(),
+		unreachable:   types.NewIDMap(),
+		connected:     types.NewPeerList(MIN_CONNECTED),
+		backlog:       types.NewPeerList(0),
+		stats:         NewDHTStats(),
 	}
 
 	// Handler for incoming connections from peers
@@ -99,25 +100,44 @@ func (dht *DHT) Start() {
 	// Connect to bootstrap peers and start crawling!
 	dht.bootstrap(ctx)
 
-	// Create timers to stop crawl and print stats
-	stopTicker := time.NewTicker(5 * time.Minute)
+	// Create a timer to print stats
+	endless := dht.crawlDuration == 0
 	statsTicker := time.NewTicker(10 * time.Second)
 
 	ch := make(chan os.Signal, 1)
 	signal.Notify(ch, os.Interrupt, syscall.SIGTERM)
 
-	for {
-		select {
-		case <-statsTicker.C:
-			dht.printCrawlStatus(getHeader("CRAWL INFO"))
-		case <-stopTicker.C:
-			cancel()
-			dht.EmitSync("stop")
-			return
-		case <-ch:
-			fmt.Println("Stopping crawl from user interrupt...")
-			cancel()
-			return
+	if endless {
+		fmt.Printf("Crawling until told to stop\n")
+		for {
+			select {
+			case <-statsTicker.C:
+				dht.printCrawlStatus(getHeader("CRAWL INFO"))
+			case <-ch:
+				fmt.Println("Stopping crawl from user interrupt...")
+				cancel()
+				dht.EmitSync("stop")
+				return
+			}
+		}
+	} else {
+		fmt.Printf("Crawling for %d minutes\n", dht.crawlDuration)
+		stopTicker := time.NewTicker(time.Duration(dht.crawlDuration) * time.Minute)
+
+		for {
+			select {
+			case <-statsTicker.C:
+				dht.printCrawlStatus(getHeader("CRAWL INFO"))
+			case <-stopTicker.C:
+				cancel()
+				dht.EmitSync("stop")
+				return
+			case <-ch:
+				fmt.Println("Stopping crawl from user interrupt...")
+				cancel()
+				dht.EmitSync("stop")
+				return
+			}
 		}
 	}
 }
