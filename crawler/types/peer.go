@@ -44,14 +44,23 @@ func NewPeer(addr peer.AddrInfo) *Peer {
 }
 
 func (p *Peer) TryConnect(host host.Host) {
-	// Add addresses to host peerstore
-	host.Peerstore().AddAddrs(p.ID, p.Addrs, time.Hour)
-
-	// Attempt to open a stream to peer. Timeout after 10 seconds
+	// Establish a connection with the peer, with a 10-second timeout
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	err := host.Connect(ctx, peer.AddrInfo{
+		ID:    p.ID,
+		Addrs: p.Addrs,
+	})
+	if err != nil {
+		cancel()
+		// fmt.Printf("Connect: %v\n", err)
+		p.Emit("unreachable", err)
+		return
+	}
+
 	stream, err := host.NewStream(ctx, p.ID, DHT_PROTO)
 	if err != nil {
 		cancel()
+		// fmt.Printf("NewStream: %v\n", err)
 		p.Emit("unreachable", err)
 		return
 	}

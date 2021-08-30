@@ -244,12 +244,12 @@ func (dht *DHT) bootstrap(ctx context.Context) {
 
 		// Set up special listeners for our bootstrap peers:
 		p.Once("connected", func() {
-			fmt.Printf("Connected to bootstrap peer: %s @ %v\n", addr.ID.Pretty(), addr.Addrs)
+			fmt.Printf("Connected to bootstrap peer: %s @ %v\n", p.ID.Pretty(), p.Addrs)
 		})
 
 		// Emitted if we were unable to reach a bootstrap peer
 		p.Once("unreachable", func(err error) {
-			fmt.Printf("Error connecting to bootstrap peer %s @ %v: %v\n", addr.ID.Pretty(), addr.Addrs, err)
+			fmt.Printf("Error connecting to bootstrap peer %s @ %v: %v\n", p.ID.Pretty(), p.Addrs, err)
 
 			atomic.AddUint64(&numUnreachable, 1)
 			if atomic.LoadUint64(&numUnreachable) >= maxUnreachable {
