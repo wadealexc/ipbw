@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -27,6 +28,15 @@ const MAX_WORKERS = 1500
 // can have before trying to connect to peers in the backlog
 const MIN_CONNECTED = 500
 
+// MAX_ATTEMPTS is the maximum number of attempts we make
+// to connect to a peer before moving them out of the backlog
+// and into "unreachable."
+//
+// Attempts are not made sequentially - after a connection attempt
+// fails, we push the peer to the end of the backlog so we can
+// prioritize connecting to peers that have been in the backlog longer.
+const MAX_ATTEMPTS = 3
+
 const PORT = 1337
 const USER_AGENT = "IPBW"
 
@@ -40,7 +50,10 @@ type DHT struct {
 
 	known        *types.IDMap // All unique peers we have heard about
 	disconnected *types.IDMap // Peers we have disconnected from
-	unreachable  *types.IDMap // Peers we were unable to connect to
+	unreachable  *types.IDMap // Peers we were unable to connect to after MAX_ATTEMPTS
+
+	mu       sync.Mutex
+	attempts map[peer.ID]uint64 // Number of connection attempts made to peers
 
 	connected *types.PeerList // Peers we are currently connected to
 	backlog   *types.PeerList // Peers we have not tried to connect to
@@ -72,6 +85,7 @@ func NewDHT(duration uint) (*DHT, error) {
 		known:         types.NewIDMap(),
 		disconnected:  types.NewIDMap(),
 		unreachable:   types.NewIDMap(),
+		attempts:      make(map[peer.ID]uint64),
 		connected:     types.NewPeerList(MIN_CONNECTED),
 		backlog:       types.NewPeerList(0),
 		stats:         NewDHTStats(),
@@ -370,9 +384,23 @@ func (dht *DHT) addListeners(ctx context.Context, p *types.Peer) {
 		// Clean up:
 		p.RemoveAllListeners()
 		atomic.AddInt64(&dht.numWorkers, -1)
-		// Log error and add to unreachable
+
+		// Add to this peer's connection attempts:
+		// If we've exceeded the max attempts, mark them
+		// unreachable. Otherwise, push them to the back
+		// of the backlog.
+		dht.mu.Lock()
+		dht.attempts[p.ID]++
+
+		if dht.attempts[p.ID] >= MAX_ATTEMPTS {
+			dht.unreachable.Add(p.ID)
+		} else {
+			dht.backlog.Add(p)
+		}
+		dht.mu.Unlock()
+
+		// Log error
 		dht.stats.logUnreachable(p, err)
-		dht.unreachable.Add(p.ID)
 	})
 }
 
