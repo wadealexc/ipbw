@@ -1,22 +1,33 @@
 # ipbw
 
-interplanetary black widow crawls ur ipfs nodes
+interplanetary black widow crawls ur ipfs and filecoin nodes
 
 This package reimplements portions of [`go-libp2p-kad-dht`](https://github.com/libp2p/go-libp2p-kad-dht) to optimize for peer discovery while crawling the DHT.
 
 ## Usage
 
-Just `go run main.go`. Configurability is a trap and should be avoided.
+```
+NAME:
+   Interplanetary Black Widow - crawls ur ipfs/filecoin nodes
+
+USAGE:
+   ipbw [global options] command [command options] [arguments...]
+
+COMMANDS:
+   help, h  Shows a list of commands or help for one command
+
+GLOBAL OPTIONS:
+   --duration NUM_MINUTES, -d NUM_MINUTES  Specify the NUM_MINUTES to run the crawler, or 0 for endless mode. (default: 0)
+   --network NETWORK, -n NETWORK           Specify the NETWORK on which to run the crawler (filecoin / ipfs) (default: "ipfs")
+   --help, -h                              show help (default: false)
+```
 
 ## TODO
 
-- Workers burning through allConnectable. Should probably implement a soft connection cap that stops more workers being spawned until we finish connecting.
 - Filter IPs to get rid of garbage
-- Better error handling: log files are difficult to read
-- Crawl Filecoin nodes
+- Integrate graph library for nice visual output
 
 ## How does the DHT work?
-
 
 (TODO)
 
@@ -54,7 +65,7 @@ There are 6 types of DHT message:
 
 ## Output
 
-Last version's output is below. This version can swing some 5000 unique peers discovered in under a minute 😎
+Last version's output is below. This version can swing 5000+ unique peers discovered in under a minute 😎
 
 The output of a 10-minute crawl was rendered in Cytoscape using an edge-weighted, force-based layout algorithm. Some discovery statistics:
 * 600 unique peers discovered within 1 minute

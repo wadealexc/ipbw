@@ -15,8 +15,8 @@ import (
 	"github.com/libp2p/go-libp2p-core/host"
 	"github.com/libp2p/go-libp2p-core/network"
 	"github.com/libp2p/go-libp2p-core/peer"
+	"github.com/libp2p/go-libp2p-core/protocol"
 	crypto "github.com/libp2p/go-libp2p-crypto"
-	kadDHT "github.com/libp2p/go-libp2p-kad-dht"
 	"github.com/wadeAlexC/go-events/events"
 	"github.com/wadeAlexC/ipbw/crawler/types"
 )
@@ -44,7 +44,9 @@ type DHT struct {
 	*events.Emitter
 	host host.Host
 
-	crawlDuration uint
+	crawlDuration uint        // Number of minutes to crawl for. 0 for unlimited
+	network       NetworkName // Either "filecoin" or "ipfs"
+	dhtProtocol   protocol.ID // The protocol string for the dht. Depends on network
 
 	numWorkers int64
 
@@ -61,7 +63,23 @@ type DHT struct {
 	stats *DHTStats
 }
 
-func NewDHT(duration uint) (*DHT, error) {
+// NewDHT creates a new DHT, ready for crawling
+//
+// duration specifies the number of minutes to crawl for,
+// or "0" for unlimited.
+//
+// network specifies the network to crawl on, either
+// "filecoin" or "ipfs"
+func NewDHT(duration uint, network string) (*DHT, error) {
+	// Make sure network is Filecoin or IPFS
+	networkName, err := FromString(network)
+	if err != nil {
+		return nil, err
+	}
+
+	// Get the DHT protocol string for the network
+	dhtProtocol := networkName.GetDHTProtocol()
+
 	// Generate a new identity
 	pk, _, err := crypto.GenerateKeyPair(crypto.RSA, 2048)
 	if err != nil {
@@ -82,6 +100,8 @@ func NewDHT(duration uint) (*DHT, error) {
 		Emitter:       events.NewEmitter(),
 		host:          host,
 		crawlDuration: duration,
+		network:       networkName,
+		dhtProtocol:   dhtProtocol,
 		known:         types.NewIDMap(),
 		disconnected:  types.NewIDMap(),
 		unreachable:   types.NewIDMap(),
@@ -92,7 +112,7 @@ func NewDHT(duration uint) (*DHT, error) {
 	}
 
 	// Handler for incoming connections from peers
-	host.SetStreamHandler(types.DHT_PROTO, dht.handleIncoming)
+	host.SetStreamHandler(dht.dhtProtocol, dht.handleIncoming)
 
 	return dht, nil
 }
@@ -122,7 +142,7 @@ func (dht *DHT) Start() {
 	signal.Notify(ch, os.Interrupt, syscall.SIGTERM)
 
 	if endless {
-		fmt.Printf("Crawling until told to stop\n")
+		fmt.Printf("Crawling %s peers until told to stop\n", dht.network)
 		for {
 			select {
 			case <-statsTicker.C:
@@ -135,7 +155,7 @@ func (dht *DHT) Start() {
 			}
 		}
 	} else {
-		fmt.Printf("Crawling for %d minutes\n", dht.crawlDuration)
+		fmt.Printf("Crawling %s peers for %d minutes\n", dht.network, dht.crawlDuration)
 		stopTicker := time.NewTicker(time.Duration(dht.crawlDuration) * time.Minute)
 
 		for {
@@ -245,7 +265,10 @@ func (dht *DHT) setup(ctx context.Context) {
 // method panics.
 func (dht *DHT) bootstrap(ctx context.Context) {
 
-	bootstrapPeers := kadDHT.GetDefaultBootstrapPeerAddrInfos()
+	bootstrapPeers := dht.network.GetBootstrapPeers()
+	if len(bootstrapPeers) == 0 {
+		panic("Couldn't find any bootstrap peers!")
+	}
 
 	numUnreachable := uint64(0)
 	maxUnreachable := uint64(len(bootstrapPeers))
@@ -257,12 +280,12 @@ func (dht *DHT) bootstrap(ctx context.Context) {
 		p := types.NewPeer(addr)
 
 		// Set up special listeners for our bootstrap peers:
-		p.Once("connected", func() {
+		p.Once("connected", func(p *types.Peer) {
 			fmt.Printf("Connected to bootstrap peer: %s @ %v\n", p.ID.Pretty(), p.Addrs)
 		})
 
 		// Emitted if we were unable to reach a bootstrap peer
-		p.Once("unreachable", func(err error) {
+		p.Once("unreachable", func(p *types.Peer, err error) {
 			fmt.Printf("Error connecting to bootstrap peer %s @ %v: %v\n", p.ID.Pretty(), p.Addrs, err)
 
 			atomic.AddUint64(&numUnreachable, 1)
@@ -287,7 +310,7 @@ func (dht *DHT) connect(ctx context.Context, p *types.Peer) {
 	dht.addListeners(ctx, p)
 
 	// Try connecting to peer
-	go p.TryConnect(dht.host)
+	go p.TryConnect(dht.host, dht.dhtProtocol)
 }
 
 // Called by libp2p when a peer connects to us using the
@@ -315,9 +338,14 @@ func (dht *DHT) handleIncoming(stream network.Stream) {
 		return
 	}
 
+	// Add to connected
+	// If we didn't add them, do nothing (racing condition)
+	if added := dht.connected.Add(p); !added {
+		return
+	}
+
 	// Record new worker
 	atomic.AddInt64(&dht.numWorkers, 1)
-	dht.connected.Add(p)
 
 	// Set up callbacks to listen for events from peer:
 	dht.addListeners(context.Background(), p)
@@ -327,12 +355,12 @@ func (dht *DHT) handleIncoming(stream network.Stream) {
 	p.SetStream(stream)
 	p.Emit("connected")
 
-	dht.stats.logInboundConn(p)
+	dht.stats.logInboundConn(p, stream.Protocol())
 }
 
 func (dht *DHT) addListeners(ctx context.Context, p *types.Peer) {
 	// Fired when we successfully connect to the peer
-	p.Once("connected", func() {
+	p.Once("connected", func(p *types.Peer) {
 
 		// Auto-disconnect after 5 minutes
 		pCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
@@ -380,7 +408,7 @@ func (dht *DHT) addListeners(ctx context.Context, p *types.Peer) {
 	})
 
 	// Fired if we are unable to connect to the peer
-	p.Once("unreachable", func(err error) {
+	p.Once("unreachable", func(p *types.Peer, err error) {
 		// Clean up:
 		p.RemoveAllListeners()
 		atomic.AddInt64(&dht.numWorkers, -1)

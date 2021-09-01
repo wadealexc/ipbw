@@ -8,6 +8,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/libp2p/go-libp2p-core/protocol"
 	"github.com/wadeAlexC/ipbw/crawler/types"
 )
 
@@ -98,7 +99,7 @@ func (st *DHTStats) logIdentify(p *types.Peer, protos []string, protoVersion str
 	st.peersIdentified++
 }
 
-func (st *DHTStats) logInboundConn(p *types.Peer) {
+func (st *DHTStats) logInboundConn(p *types.Peer, proto protocol.ID) {
 	atomic.AddUint64(&st.totalInbound, 1)
 }
 
@@ -211,9 +212,9 @@ func (st *DHTStats) getPeerStats() []string {
 		outCount := 0
 		for _, proto := range pInfo.names {
 			strs = append(strs, fmt.Sprintf("--- %s: %d", proto.name, proto.count))
-			// Limit output for each to 5 to reduce clutter
+			// Limit output for each to reduce clutter
 			outCount++
-			if outCount >= 5 && len(pInfo.names) > outCount {
+			if outCount >= 15 && len(pInfo.names) > outCount {
 				strs = append(strs, fmt.Sprintf("...trimmed %d additional %s protocols", len(pInfo.names)-outCount, pInfo.prefix))
 				break
 			}
@@ -233,7 +234,7 @@ func (st *DHTStats) getPeerStats() []string {
 		outCount := 0
 		for _, proto := range pInfo.names {
 			strs = append(strs, fmt.Sprintf("--- %s: %d", proto.name, proto.count))
-			// Limit output for each to 5 to reduce clutter
+			// Limit output for each to reduce clutter
 			outCount++
 			if outCount >= 5 && len(pInfo.names) > outCount {
 				strs = append(strs, fmt.Sprintf("...trimmed %d additional %s versions", len(pInfo.names)-outCount, pInfo.prefix))
@@ -255,9 +256,9 @@ func (st *DHTStats) getPeerStats() []string {
 		outCount := 0
 		for _, proto := range pInfo.names {
 			strs = append(strs, fmt.Sprintf("--- %s: %d", proto.name, proto.count))
-			// Limit output for each to 5 to reduce clutter
+			// Limit output for each to reduce clutter
 			outCount++
-			if outCount >= 5 && len(pInfo.names) > outCount {
+			if outCount >= 15 && len(pInfo.names) > outCount {
 				strs = append(strs, fmt.Sprintf("...trimmed %d additional %s user agents", len(pInfo.names)-outCount, pInfo.prefix))
 				break
 			}
@@ -334,25 +335,54 @@ func splitByPrefix(m map[string]uint64) []*prefixInfo {
 	return pfxInfos
 }
 
+// Given a string, attempts to derive a prefix, assuming
+// the string is delimited by either "/" or "-"
 func getPrefix(proto string) string {
-	strs := strings.Split(proto, "/")
+	// Shouldn't happen
+	if len(proto) == 0 {
+		return "NONE"
+	}
+
+	idxSlash := strings.Index(proto, "/")
+	idxDash := strings.Index(proto, "-")
+
+	// Does not contain "/" or "-"
+	if idxSlash == -1 && idxDash == -1 {
+		return proto
+	}
+
+	// Determine the separator depending on whether "/" or
+	// "-" comes first
+	var sep string
+	if idxSlash == -1 {
+		sep = "-"
+	} else if idxDash == -1 {
+		sep = "/"
+	} else if idxSlash < idxDash {
+		sep = "/"
+	} else {
+		sep = "-"
+	}
+
+	strs := strings.Split(proto, sep)
 
 	// Shouldn't happen unless the proto string is empty
 	if len(strs) == 0 {
 		return "NONE"
 	}
 
-	// Proto string did not contain "/"
+	// Proto string did not contain sep
 	if len(strs) == 1 {
 		return strs[0]
 	}
 
-	// Proto string contained "/" at beginning
+	// Proto string contained sep at beginning
+	// e.g: /ipfs/kad/1.0.0
 	if strs[0] == "" {
 		return strs[1]
 	}
 
-	// Proto string contained "/", but not at beginning
-	// (This is unusual)
+	// Proto string contained sep, but not at beginning
+	// e.g: lotus-1.10.1
 	return strs[0]
 }

@@ -10,12 +10,11 @@ import (
 	"github.com/libp2p/go-libp2p-core/network"
 	"github.com/libp2p/go-libp2p-core/peer"
 	"github.com/libp2p/go-libp2p-core/peerstore"
+	"github.com/libp2p/go-libp2p-core/protocol"
 	"github.com/libp2p/go-msgio"
 	ma "github.com/multiformats/go-multiaddr"
 	"github.com/wadeAlexC/go-events/events"
 )
-
-const DHT_PROTO = "/ipfs/kad/1.0.0"
 
 // Peer represents a connection with a peer
 type Peer struct {
@@ -43,7 +42,7 @@ func NewPeer(addr peer.AddrInfo) *Peer {
 	}
 }
 
-func (p *Peer) TryConnect(host host.Host) {
+func (p *Peer) TryConnect(host host.Host, proto protocol.ID) {
 	// Establish a connection with the peer, with a 10-second timeout
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	err := host.Connect(ctx, peer.AddrInfo{
@@ -53,20 +52,20 @@ func (p *Peer) TryConnect(host host.Host) {
 	if err != nil {
 		cancel()
 		// fmt.Printf("Connect: %v\n", err)
-		p.Emit("unreachable", err)
+		p.Emit("unreachable", p, err)
 		return
 	}
 
-	stream, err := host.NewStream(ctx, p.ID, DHT_PROTO)
+	stream, err := host.NewStream(ctx, p.ID, proto)
 	if err != nil {
 		cancel()
 		// fmt.Printf("NewStream: %v\n", err)
-		p.Emit("unreachable", err)
+		p.Emit("unreachable", p, err)
 		return
 	}
 
 	p.stream = stream
-	p.Emit("connected")
+	p.Emit("connected", p)
 }
 
 func (p *Peer) SetStream(stream network.Stream) {
