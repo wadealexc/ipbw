@@ -353,7 +353,7 @@ func (dht *DHT) handleIncoming(stream network.Stream) {
 	// Give peer the stream and emit connected -
 	// listeners will start work.
 	p.SetStream(stream)
-	p.Emit("connected")
+	p.Emit("connected", p)
 
 	dht.stats.logInboundConn(p, stream.Protocol())
 }
